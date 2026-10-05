@@ -1,0 +1,7 @@
+/target/
+/.idea/
+/.codex/
+/.tmp-*
+*.log
+.env
+.env.*

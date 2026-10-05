@@ -1,0 +1,42 @@
+[
+  {
+    "path": "ansi-unicode-pwsh-v1/output.bin",
+    "sha256": "34b18c8d724b452e40f46163dcdb571b41993bd576cf4a11e761169604dc8519"
+  },
+  {
+    "path": "smoke-cmd-v1/output.bin",
+    "sha256": "06556a6ed83c7b8ae3a81bdba9940df0494e9334eee54b1ebdccaea7780d8618"
+  },
+  {
+    "path": "smoke-powershell-v1/output.bin",
+    "sha256": "e4ce70d544eab5cb91f545e19aa6bed528a3d633012b2c57090450d3fbd1db0f"
+  },
+  {
+    "path": "smoke-pwsh-v1/output.bin",
+    "sha256": "6ef6da01bdd21035af310bd2e42d559cddae5a836757989ac8bb4b9ee19c4301"
+  },
+  {
+    "path": "smoke-wsl-v1/output.bin",
+    "sha256": "5576040889eca60540cb2ae88d87604b71b90ba0f18c0a60fec1abffbd738f87"
+  },
+  {
+    "path": "terminal-features-pwsh-v1/output.bin",
+    "sha256": "fae778e1966261543054113394a0953078444ff4b63c7bd6b3fae64a6312ddb9"
+  },
+  {
+    "path": "tui-fzf-wsl-v1/output.bin",
+    "sha256": "9919107887b27451b1acbfd5cbd48a56315a893287f271e3fa223286e5a82a12"
+  },
+  {
+    "path": "tui-htop-wsl-v1/output.bin",
+    "sha256": "23b66fa4eafd9c17e4b75b5d28cb92e820d52ad66dec0108b0842f16a3e64326"
+  },
+  {
+    "path": "tui-less-wsl-v1/output.bin",
+    "sha256": "efc44b862fc7bcf30f14007cadac77f78290f285f9877be874656bc4b67da5c4"
+  },
+  {
+    "path": "tui-vim-wsl-v1/output.bin",
+    "sha256": "fbc811a6b3074ad00a4b9f93de379139e14b51cd52add90a41c82b223f8995e4"
+  }
+]
