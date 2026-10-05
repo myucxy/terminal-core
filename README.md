@@ -17,9 +17,39 @@ The local `.cargo/config.toml` preserves the Windows static CRT setting.
 Golden replay inputs are in [testdata](testdata/terminal-golden-streams/README.md),
 so core tests do not require a checkout of the application.
 
-Windows and Android application builds currently consume this sibling source
-checkout. Each client release must record both application and core revisions,
-their clean/dirty state, and resulting native binary hashes.
+Windows and Android application builds consume prebuilt DLL/SO files, without
+accessing this source checkout. Core owns the Rust implementation, C headers,
+Android JNI C++, CMake, and all core compilation scripts. Application-side
+C#/Kotlin bindings and views remain with the application.
+
+## Build and export to TermLink
+
+From this repository on Windows, using the pinned D:\Dev tool inventory:
+
+```powershell
+.\scripts\Build-ToTermLink.ps1
+# Optional explicit application source destination:
+.\scripts\Build-ToTermLink.ps1 -TermLinkDirectory E:\WorkSpace\AICodeProject\TermLink\termlink
+```
+
+The script builds Windows x64 and all four Android ABIs, then copies only
+`termlink_terminal_ffi.dll` and `libtermlink_terminal_jni.so` into the application's
+`native/terminal-core/` directory. The C++ JNI wrapper is in `android/jni/`;
+its registered Java names and the C ABI are unchanged. All build caches stay in
+core `target/`; staged binaries and their manifest stay in core `dist/`.
+
+`terminal-core.lock.json` in the application records source revision, dirty state,
+file sizes and SHA-256 hashes. It is written only after all five libraries have
+built and copied successfully. Commit the application binaries and lock together.
+Application packaging verifies these files and never invokes a core compiler.
+The application can be built from a clone with no sibling core repository.
+
+By default export requires a clean, committed core checkout. `-Development`
+allows uncommitted core work, explicitly marks the resulting package dirty,
+and cannot pass the application's Production gate. Tool paths can be overridden
+with script parameters; no global PATH or service settings are changed.
+Public redistribution rights are not granted by this workflow; the existing
+Proprietary declaration is unchanged.
 
 The original implementation notes below retain their historical context.
 
