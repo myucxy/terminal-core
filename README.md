@@ -1,5 +1,17 @@
 # TermLink Terminal Core
 
+Project-owned code is licensed under the GNU General Public License version 3
+only (`GPL-3.0-only`); see [LICENSE](LICENSE) and [NOTICE](NOTICE). This includes
+the Rust engine, C ABI, Android JNI, build scripts and tests. Third-party
+material retains its original terms and attribution. GPLv3 permits commercial
+use and requires Corresponding Source when conveying binaries as specified
+by the license.
+
+The maintainer selected GPLv3 on 2026-10-09 and plans to open this repository
+later. This local licensing change does not make the remote public. Before
+distributing new GPLv3 binaries, make the matching source and build materials
+available to recipients; a private GitHub URL alone is not sufficient.
+
 ## Independent repository (2026-10-05)
 
 This repository is maintained separately from the sibling TermLink application
@@ -8,9 +20,9 @@ repository. Its source was imported from
 terminal runtime implementation. The application repository retains the older
 development history; the remote's initial README commit is preserved here.
 
-The current license declaration remains `Proprietary`. A repository URL is not
-a public redistribution grant. Confirm repository visibility before uploading
-source. Public binary SDK distribution is not implemented by this split.
+At the time of the split the license declaration was `Proprietary`; the
+2026-10-09 GPLv3 decision above supersedes that declaration for project-owned
+code. Repository visibility and source publication remain separate actions.
 
 Run `cargo +1.97.1 test --workspace --locked --offline` from this repository.
 The local `.cargo/config.toml` preserves the Windows static CRT setting.
@@ -48,8 +60,13 @@ By default export requires a clean, committed core checkout. `-Development`
 allows uncommitted core work, explicitly marks the resulting package dirty,
 and cannot pass the application's Production gate. Tool paths can be overridden
 with script parameters; no global PATH or service settings are changed.
-Public redistribution rights are not granted by this workflow; the existing
-Proprietary declaration is unchanged.
+Binary distribution must comply with GPLv3, include LICENSE and NOTICE, and
+provide source matching the recorded revision together with the build scripts.
+The export workflow still copies only DLL/SO files into the application's
+native directory; the application supplies the license text with its packages.
+Do not rewrite an existing binary's recorded revision after a license-only
+change. Preserve its actual source revision and include the GPLv3 grant with
+the corresponding source delivery.
 
 The original implementation notes below retain their historical context.
 
@@ -69,8 +86,11 @@ stated separately below.
 - `termlink-terminal-ffi`: panic-contained C ABI and owned-buffer boundary.
 - `include/termlink_terminal.h`: public C declarations.
 - [`UNIMPLEMENTED_CAPABILITIES.md`](UNIMPLEMENTED_CAPABILITIES.md): explicit
-  DRCS, SIXEL/Kitty graphics, History Page, and Delta gaps, dependencies, and
-  completion criteria.
+  P0 query-compatibility, DRCS, SIXEL/Kitty graphics, History Page, and Delta
+  gaps, dependencies, and completion criteria.
+- [`WINDOWS_TERMINAL_CAPABILITY_REVIEW_20261009.md`](WINDOWS_TERMINAL_CAPABILITY_REVIEW_20261009.md):
+  source-pinned comparison, 18 confirmed capability/behavior gap groups,
+  synthetic probe results, platform boundaries, and implementation priorities.
 - [`DEVELOPMENT_ROADMAP.md`](DEVELOPMENT_ROADMAP.md): prioritized, resumable
   plan for evolving the core into a broadly compatible CLI/TUI production
   runtime, including cross-platform and release gates.
@@ -175,9 +195,33 @@ payloads are contiguous. The exact hard maximum is 65,710,862 bytes for the
 same 256-event/4-MiB capture limit. A successful apply with no effects still
 returns the canonical owned 64-byte empty frame.
 
-An unsupported escape/control sequence also fails the instance closed. A
+Unsupported state-changing escape/control sequences still fail the instance closed. A
 failed-closed instance accepts no more events and cannot create a checkpoint.
 Destroy it and recover from a prior checkpoint plus a continuous source suffix.
+
+Compatibility update (2026-10-09, development; see
+[`QUERY_COMPATIBILITY_FIX_20261009.md`](QUERY_COMPATIBILITY_FIX_20261009.md)):
+
+- Read-only geometry probes `CSI 14/15/16/18/19 t` no longer retire the core.
+  Exact `18t` emits `CSI 8;rows;columns t` using authority geometry. The other
+  probes and unsupported numeric variants are consumed without a reply; no
+  physical pixel/screen dimensions are fabricated. Parser limits and malformed
+  syntax rejection remain in force.
+- Character-size replies extend the Host Effect V2 payload grammar, with both
+  coordinates in `1..512`. V1 remains frozen: it returns
+  `HostEffectVersionRequired` without poisoning state, allowing a V2 retry.
+  Windows and Android V2 validators must be upgraded with these binaries.
+- Exact `CSI ! p` implements DECSTR without clearing cells, history, tab stops,
+  title, cursor position or screen selection. It resets active cursor attributes
+  and saved state, character sets, margins, insert/origin/wrap and cursor/keypad
+  modes; Win32, mouse, focus and paste protocols remain intact.
+- DECRQM reports `2027` as unrecognized in legacy width profile 1. Explicit
+  Unicode 16 width profile 2 implements UAX #29 joining and the 2027 switch,
+  uses Snapshot 2.12+ and requires Render V4. Mode `2031` is recognized after an
+  ordered `HOST_THEME_V1` event supplies an actual selected-host theme. Theme
+  queries, palette ownership and Snapshot 2.19 are described in
+  [the host-theme implementation record](S2_HOST_THEME_20261010.md). Hosts without
+  that event remain unknown. Legacy stored bits stay round-trip compatible.
 
 `CSI ?2026h` begins DEC synchronized output and `CSI ?2026l` ends it. Begin is
 not nested; another begin restarts a one-second logical-time deadline. The core
@@ -385,7 +429,8 @@ ID frontier together with the rest of terminal state.
 
 Resize/crop/reflow preserves the history/viewport boundary and visible cursor,
 saved-cursor, and logical anchors within the configured limits. This remains
-bounded runtime storage, not a public paged History Page wire/API. Portable
+bounded runtime storage; the additive [History Page API](S5_IMMUTABLE_HISTORY_20261010.md)
+now captures and pages sealed primary text lines independently. Portable
 Snapshot V2.10 freezes this bounded history, while ordinary Render Frame bytes
 keep their visible-window semantics; the offset renderer reads only the history
 frozen inside its local checkpoint.
@@ -564,18 +609,27 @@ Current deliberate boundaries:
 - Dimensions are 1..512 columns by 1..512 rows, at most 262,144 cells.
 - An output event is at most 1 MiB.
 - Width profile v1 supports bounded combining/ZWJ graphemes, CJK/emoji width 2,
-  and explicit continuation cells. Full Unicode grapheme segmentation, bidi,
-  ordinary-output 8-bit GR mapping, DRCS and other unsupported charset families,
-  stateful DCS, and SIXEL/images are not yet implemented.
+  and explicit continuation cells. Explicit profile 2 adds Unicode 16 UAX #29
+  segmentation (1,093 official vectors) and a 48-byte grapheme bound. Bidi,
+  ordinary-output 8-bit GR mapping, DRCS and remaining charset families,
+  macros, SIXEL/images remain outside current implemented scope.
+- ESC #3/4/5/6/8 implements DEC line renditions/alignment, including effective
+  columns, cropping, scroll/history and resize. Scaled rows require Snapshot
+  2.13 and Render V4 (`0x7ff` features); V1–V3 fail explicitly. Android View
+  renders scaled/clipped text; opt-in Windows native display is tested, while
+  profile attachment negotiation remains a product integration requirement. See
+  [line-rendition evidence](S2_LINE_RENDITIONS_20261009.md) and
+  [color/native-window evidence](S2_COLORS_NATIVE_DISPLAY_20261009.md).
 - The default UTF-8 output profile does not reinterpret raw `0x80..0x9f` bytes
   as standalone C1. The explicit standalone-C1 profile recognizes 13 supported
   one-byte aliases only at UTF-8 scalar boundaries: IND, NEL, HTS, RI, SS2,
   SS3, DCS, SOS, CSI, ST, OSC, PM, and APC. Other C1 controls fail closed, and
   a UTF-8-encoded C1 scalar is not reinterpreted as standalone C1. The input
   paste encoder independently strips raw and UTF-8-encoded C1 controls.
-- Runtime history capture and V2.10 checkpoint persistence are implemented, but
-  immutable History Page V1 tokens, bounded sealed-logical-line pagination,
-  durable transcript projection, and a public history FFI are not. Legacy
+- Runtime history capture, V2.10 persistence, immutable History Page V1 tokens,
+  bounded sealed-logical-line pagination and C/JNI/.NET APIs are implemented.
+  Command markers, graphics resources, remote paging and durable transcript projection
+  still require integration; see [S5 evidence](S5_IMMUTABLE_HISTORY_20261010.md). Legacy
   V2.1..V2.9 snapshots and ordinary Render Frame versions exclude hidden cells;
   V2.10 retains the bounded primary prefix.
 - Tab stops default to every eight columns and are dynamically changed by

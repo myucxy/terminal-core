@@ -21,6 +21,7 @@ const PALETTE_SIZE: usize = 256;
 
 const OSC_CODEC_MAGIC: &[u8; 8] = b"TLOSCV1\0";
 const OSC_CODEC_VERSION: u16 = 2;
+const OSC_CODEC_EXTENDED_COLORS_VERSION: u16 = 3;
 const OSC_CODEC_LEGACY_VERSION: u16 = 1;
 const LEGACY_MAX_TITLE_STACK_DEPTH: usize = 32;
 const OSC_CODEC_HEADER_BYTES: usize = 12;
@@ -36,7 +37,8 @@ const OSC_CODEC_PARAM_RECORD_BYTES: usize = 8;
 ///
 /// The bound combines all independently capped title fields and stacks with
 /// the hyperlink table's entry, parameter, and stored-byte maxima.
-pub(crate) const MAX_OSC_SNAPSHOT_V2_BYTES: usize = OSC_CODEC_HEADER_BYTES
+pub(crate) const MAX_OSC_SNAPSHOT_V2_BYTES: usize = 12
+    + OSC_CODEC_HEADER_BYTES
     + (2 * PALETTE_SIZE * OSC_CODEC_COLOR_BYTES)
     + (6 * OSC_CODEC_COLOR_BYTES)
     + (2 * (OSC_CODEC_LENGTH_BYTES + MAX_TITLE_BYTES))
@@ -172,6 +174,7 @@ pub enum DefaultColorSlot {
     Foreground,
     Background,
     Cursor,
+    SelectionBackground,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -408,11 +411,15 @@ struct TitleStackSlot {
 /// identity by itself.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OscState {
+    theme_scheme: u8,
+    color_overrides: [u8; 33],
     baseline: OscBaseline,
     palette: [Option<OscColor>; PALETTE_SIZE],
     foreground: Option<OscColor>,
     background: Option<OscColor>,
     cursor: Option<OscColor>,
+    selection_background: Option<OscColor>,
+    color_aliases: [Option<u16>; 4],
     icon_title: String,
     window_title: String,
     title_stack: [TitleStackSlot; MAX_TITLE_STACK_DEPTH],
@@ -433,10 +440,14 @@ impl OscState {
     pub fn new(baseline: OscBaseline) -> Self {
         Self {
             baseline,
+            theme_scheme: 0,
+            color_overrides: [0; 33],
             palette: baseline.palette,
             foreground: baseline.foreground,
             background: baseline.background,
             cursor: baseline.cursor,
+            selection_background: None,
+            color_aliases: [None; 4],
             icon_title: String::new(),
             window_title: String::new(),
             title_stack: std::array::from_fn(|_| TitleStackSlot::default()),
@@ -450,6 +461,118 @@ impl OscState {
     #[must_use]
     pub const fn baseline(&self) -> &OscBaseline {
         &self.baseline
+    }
+
+    pub(crate) fn theme_scheme(&self) -> u8 {
+        self.theme_scheme
+    }
+
+    fn overridden(&self, index: usize) -> bool {
+        self.color_overrides[index / 8] & (1 << (index % 8)) != 0
+    }
+
+    fn mark_override(&mut self, index: usize, value: bool) {
+        if self.theme_scheme == 0 {
+            return;
+        }
+        let bit = 1 << (index % 8);
+        if value {
+            self.color_overrides[index / 8] |= bit;
+        } else {
+            self.color_overrides[index / 8] &= !bit;
+        }
+    }
+
+    fn default_slot_index(&self, slot: DefaultColorSlot) -> usize {
+        self.alias_index(slot)
+            .map(usize::from)
+            .unwrap_or(match slot {
+                DefaultColorSlot::Foreground => 256,
+                DefaultColorSlot::Background => 257,
+                DefaultColorSlot::Cursor => 258,
+                DefaultColorSlot::SelectionBackground => 259,
+            })
+    }
+
+    pub(crate) fn apply_host_theme(&mut self, theme: &crate::HostThemeV1) {
+        if self.theme_scheme == 0 {
+            self.theme_scheme = theme.scheme;
+            // Old snapshots have no ownership bits. Preserve every materialized
+            // color when first adopting a theme, even if equal to the old baseline.
+            for index in 0..256 {
+                self.mark_override(index, self.palette[index].is_some());
+            }
+            self.mark_override(256, self.foreground.is_some());
+            self.mark_override(257, self.background.is_some());
+            self.mark_override(258, self.cursor.is_some());
+            self.mark_override(259, self.selection_background.is_some());
+        }
+        self.baseline = theme.baseline;
+        self.theme_scheme = theme.scheme;
+        for index in 0..256 {
+            if !self.overridden(index) {
+                self.palette[index] = self.baseline.palette[index];
+            }
+        }
+        if !self.overridden(256) {
+            self.foreground = self.baseline.foreground;
+        }
+        if !self.overridden(257) {
+            self.background = self.baseline.background;
+        }
+        if !self.overridden(258) {
+            self.cursor = self.baseline.cursor;
+        }
+    }
+
+    pub(crate) fn reset_to_host_baseline(&mut self) {
+        let scheme = self.theme_scheme;
+        *self = Self::new(self.baseline);
+        self.theme_scheme = scheme;
+    }
+
+    pub(crate) fn encode_theme_state(&self) -> [u8; crate::host_theme::THEME_STATE_BYTES] {
+        let mut value = [0; crate::host_theme::THEME_STATE_BYTES];
+        value[0] = 1;
+        value[4] = self.theme_scheme;
+        value[5..38].copy_from_slice(&self.color_overrides);
+        value
+    }
+
+    pub(crate) fn restore_theme_state(&mut self, bytes: &[u8]) -> Result<(), crate::TerminalError> {
+        use crate::TerminalError::MalformedSnapshot;
+        if bytes.len() != crate::host_theme::THEME_STATE_BYTES
+            || bytes[..4] != 1u32.to_le_bytes()
+            || !matches!(bytes[4], 1 | 2)
+            || bytes[37] & 0xf0 != 0
+            || bytes[38..] != [0; 2]
+        {
+            return Err(MalformedSnapshot);
+        }
+        if self.baseline.palette.iter().any(Option::is_none)
+            || self.baseline.foreground.is_none()
+            || self.baseline.background.is_none()
+            || self.baseline.cursor.is_none()
+        {
+            return Err(MalformedSnapshot);
+        }
+        self.theme_scheme = bytes[4];
+        self.color_overrides.copy_from_slice(&bytes[5..38]);
+        for index in 0..260 {
+            let (current, baseline) = match index {
+                0..=255 => (self.palette[index], self.baseline.palette[index]),
+                256 => (self.foreground, self.baseline.foreground),
+                257 => (self.background, self.baseline.background),
+                258 => (self.cursor, self.baseline.cursor),
+                _ => (self.selection_background, None),
+            };
+            if (self.overridden(index) && current.is_none())
+                || (!self.overridden(index) && current != baseline)
+            {
+                return Err(MalformedSnapshot);
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -470,6 +593,60 @@ impl OscState {
     #[must_use]
     pub const fn cursor_color(&self) -> Option<OscColor> {
         self.cursor
+    }
+
+    #[must_use]
+    pub const fn selection_background(&self) -> Option<OscColor> {
+        self.selection_background
+    }
+
+    #[must_use]
+    pub const fn color_aliases(&self) -> &[Option<u16>; 4] {
+        &self.color_aliases
+    }
+
+    pub(crate) fn has_extended_colors(&self) -> bool {
+        self.selection_background.is_some() || self.color_aliases.iter().any(Option::is_some)
+    }
+
+    pub(crate) fn assign_colors(
+        &mut self,
+        item: u16,
+        foreground: u16,
+        background: u16,
+    ) -> Result<(), OscError> {
+        if !(1..=2).contains(&item) || foreground > 257 || background > 257 {
+            return Err(OscError::MalformedPayload(
+                "DECAC requires item 1 or 2 and color indexes 0..257",
+            ));
+        }
+        let start = usize::from(item - 1) * 2;
+        self.color_aliases[start] = (foreground != 256).then_some(foreground);
+        self.color_aliases[start + 1] = (background != 257).then_some(background);
+        Ok(())
+    }
+
+    fn alias_index(&self, slot: DefaultColorSlot) -> Option<u16> {
+        match slot {
+            DefaultColorSlot::Foreground => self.color_aliases[0],
+            DefaultColorSlot::Background => self.color_aliases[1],
+            _ => None,
+        }
+    }
+
+    fn default_baseline(&self, slot: DefaultColorSlot) -> Option<OscColor> {
+        match self.alias_index(slot) {
+            Some(index @ 0..=255) => self.baseline.palette[usize::from(index)],
+            Some(256) => self.baseline.foreground,
+            Some(257) => self.baseline.background,
+            Some(_) => unreachable!("validated color alias"),
+            None => match slot {
+                DefaultColorSlot::Foreground => self.baseline.foreground,
+                DefaultColorSlot::Background => self.baseline.background,
+                DefaultColorSlot::Cursor => self.baseline.cursor,
+                DefaultColorSlot::SelectionBackground => None,
+            },
+        }
     }
 
     #[must_use]
@@ -510,7 +687,9 @@ impl OscState {
         let legacy_title_stack = self.has_legacy_codec_title_stack();
         let mut writer = OscCodecWriter::with_capacity(encoded_len)?;
         writer.bytes(OSC_CODEC_MAGIC);
-        writer.u16(if legacy_title_stack {
+        writer.u16(if self.has_extended_colors() {
+            OSC_CODEC_EXTENDED_COLORS_VERSION
+        } else if legacy_title_stack {
             OSC_CODEC_LEGACY_VERSION
         } else {
             OSC_CODEC_VERSION
@@ -527,6 +706,12 @@ impl OscState {
             self.cursor,
         ] {
             encode_codec_color(&mut writer, color);
+        }
+        if self.has_extended_colors() {
+            encode_codec_color(&mut writer, self.selection_background);
+            for alias in self.color_aliases {
+                writer.u16(alias.unwrap_or(u16::MAX));
+            }
         }
         encode_codec_text(&mut writer, &self.icon_title);
         encode_codec_text(&mut writer, &self.window_title);
@@ -587,6 +772,9 @@ impl OscState {
             + (2 * OSC_CODEC_LENGTH_BYTES)
             + self.icon_title.len()
             + self.window_title.len();
+        if self.has_extended_colors() {
+            encoded_len = codec_add(encoded_len, 12)?;
+        }
         if self.has_legacy_codec_title_stack() {
             encoded_len = codec_add(encoded_len, 2 * OSC_CODEC_STACK_HEADER_BYTES)?;
         } else {
@@ -638,7 +826,8 @@ impl OscState {
     }
 
     fn has_legacy_codec_title_stack(&self) -> bool {
-        self.title_stack_position == 0
+        !self.has_extended_colors()
+            && self.title_stack_position == 0
             && self
                 .title_stack
                 .iter()
@@ -666,6 +855,9 @@ impl OscState {
             10 => self.apply_default_color_with_query(DefaultColorSlot::Foreground, payload),
             11 => self.apply_default_color_with_query(DefaultColorSlot::Background, payload),
             12 => self.apply_default_color_with_query(DefaultColorSlot::Cursor, payload),
+            17 => {
+                self.apply_default_color_with_query(DefaultColorSlot::SelectionBackground, payload)
+            }
             _ => Ok((
                 self.apply_after_payload_limit(selector, payload)?,
                 Vec::new(),
@@ -681,16 +873,18 @@ impl OscState {
         match selector {
             0 => self.set_title(TitleTarget::Both, payload),
             1 => self.set_title(TitleTarget::Icon, payload),
-            2 => self.set_title(TitleTarget::Window, payload),
+            2 | 21 => self.set_title(TitleTarget::Window, payload),
             4 => self.apply_palette(payload),
             8 => self.apply_hyperlink(payload),
             10 => self.apply_default_color(DefaultColorSlot::Foreground, payload),
             11 => self.apply_default_color(DefaultColorSlot::Background, payload),
             12 => self.apply_default_color(DefaultColorSlot::Cursor, payload),
+            17 => self.apply_default_color(DefaultColorSlot::SelectionBackground, payload),
             104 => self.reset_palette(payload),
             110 => self.reset_default_color(DefaultColorSlot::Foreground, payload),
             111 => self.reset_default_color(DefaultColorSlot::Background, payload),
             112 => self.reset_default_color(DefaultColorSlot::Cursor, payload),
+            117 => self.reset_default_color(DefaultColorSlot::SelectionBackground, payload),
             _ => Ok(OscEffect::UnknownSelector { selector }),
         }
     }
@@ -826,6 +1020,7 @@ impl OscState {
         for operation in plan.operations() {
             if let PaletteOperation::Set { index, color } = operation {
                 self.palette[usize::from(index)] = Some(color);
+                self.mark_override(usize::from(index), true);
             }
         }
         Ok(plan.effect())
@@ -845,6 +1040,7 @@ impl OscState {
             match operation {
                 PaletteOperation::Set { index, color } => {
                     self.palette[usize::from(index)] = Some(color);
+                    self.mark_override(usize::from(index), true);
                 }
                 PaletteOperation::Query { index } => {
                     queries.push(OscColorQueryResult::Palette {
@@ -879,6 +1075,7 @@ impl OscState {
         for index in u8::MIN..=u8::MAX {
             if reset.contains(index) {
                 self.palette[usize::from(index)] = self.baseline.palette[usize::from(index)];
+                self.mark_override(usize::from(index), false);
             }
         }
         Ok(OscEffect::PaletteReset { reset })
@@ -897,16 +1094,14 @@ impl OscState {
         // Treat that spelling as the baseline-reset alias while keeping all
         // other non-color payloads fail-closed.
         if payload == b"default" {
-            let baseline = match slot {
-                DefaultColorSlot::Foreground => self.baseline.foreground,
-                DefaultColorSlot::Background => self.baseline.background,
-                DefaultColorSlot::Cursor => self.baseline.cursor,
-            };
+            let baseline = self.default_baseline(slot);
             *self.default_color_mut(slot) = baseline;
+            self.mark_override(self.default_slot_index(slot), false);
             return Ok(OscEffect::DefaultColorReset { slot });
         }
         let color = parse_color(payload)?;
         *self.default_color_mut(slot) = Some(color);
+        self.mark_override(self.default_slot_index(slot), true);
         Ok(OscEffect::DefaultColorSet { slot })
     }
 
@@ -923,11 +1118,7 @@ impl OscState {
         }
         let effect = self.apply_default_color(slot, payload)?;
         if payload == b"?" {
-            let color = match slot {
-                DefaultColorSlot::Foreground => self.foreground,
-                DefaultColorSlot::Background => self.background,
-                DefaultColorSlot::Cursor => self.cursor,
-            };
+            let color = *self.default_color_mut(slot);
             queries.push(OscColorQueryResult::DefaultColor { slot, color });
         }
         Ok((effect, queries))
@@ -943,20 +1134,24 @@ impl OscState {
                 "default-color reset requires an empty payload",
             ));
         }
-        let baseline = match slot {
-            DefaultColorSlot::Foreground => self.baseline.foreground,
-            DefaultColorSlot::Background => self.baseline.background,
-            DefaultColorSlot::Cursor => self.baseline.cursor,
-        };
+        let baseline = self.default_baseline(slot);
         *self.default_color_mut(slot) = baseline;
+        self.mark_override(self.default_slot_index(slot), false);
         Ok(OscEffect::DefaultColorReset { slot })
     }
 
     fn default_color_mut(&mut self, slot: DefaultColorSlot) -> &mut Option<OscColor> {
-        match slot {
-            DefaultColorSlot::Foreground => &mut self.foreground,
-            DefaultColorSlot::Background => &mut self.background,
-            DefaultColorSlot::Cursor => &mut self.cursor,
+        match self.alias_index(slot) {
+            Some(index @ 0..=255) => &mut self.palette[usize::from(index)],
+            Some(256) => &mut self.foreground,
+            Some(257) => &mut self.background,
+            Some(_) => unreachable!("validated color alias"),
+            None => match slot {
+                DefaultColorSlot::Foreground => &mut self.foreground,
+                DefaultColorSlot::Background => &mut self.background,
+                DefaultColorSlot::Cursor => &mut self.cursor,
+                DefaultColorSlot::SelectionBackground => &mut self.selection_background,
+            },
         }
     }
 
@@ -1199,7 +1394,10 @@ fn preflight_osc_snapshot_v2(bytes: &[u8]) -> Result<usize, OscCodecError> {
         return Err(OscCodecError::Malformed);
     }
     let version = reader.u16()?;
-    if version != OSC_CODEC_VERSION && version != OSC_CODEC_LEGACY_VERSION {
+    if !matches!(
+        version,
+        OSC_CODEC_VERSION | OSC_CODEC_LEGACY_VERSION | OSC_CODEC_EXTENDED_COLORS_VERSION
+    ) {
         return Err(OscCodecError::Malformed);
     }
     require_codec_zero(reader.u16()?)?;
@@ -1208,10 +1406,17 @@ fn preflight_osc_snapshot_v2(bytes: &[u8]) -> Result<usize, OscCodecError> {
     for _ in 0..6 {
         preflight_codec_color(&mut reader)?;
     }
+    if version == OSC_CODEC_EXTENDED_COLORS_VERSION {
+        let selection = decode_codec_color(&mut reader)?;
+        let aliases = decode_color_aliases(&mut reader)?;
+        if selection.is_none() && aliases.iter().all(Option::is_none) {
+            return Err(OscCodecError::Malformed);
+        }
+    }
     preflight_codec_text(&mut reader, MAX_TITLE_BYTES)?;
     preflight_codec_text(&mut reader, MAX_TITLE_BYTES)?;
-    if version == OSC_CODEC_VERSION {
-        if !preflight_codec_title_stack(&mut reader)? {
+    if version >= OSC_CODEC_VERSION {
+        if !preflight_codec_title_stack(&mut reader)? && version == OSC_CODEC_VERSION {
             return Err(OscCodecError::Malformed);
         }
     } else {
@@ -1425,9 +1630,17 @@ fn decode_osc_snapshot_v2(bytes: &[u8]) -> Result<OscState, OscCodecError> {
     let foreground = decode_codec_color(&mut reader)?;
     let background = decode_codec_color(&mut reader)?;
     let cursor = decode_codec_color(&mut reader)?;
+    let (selection_background, color_aliases) = if version == OSC_CODEC_EXTENDED_COLORS_VERSION {
+        (
+            decode_codec_color(&mut reader)?,
+            decode_color_aliases(&mut reader)?,
+        )
+    } else {
+        (None, [None; 4])
+    };
     let icon_title = decode_codec_text(&mut reader, MAX_TITLE_BYTES)?;
     let window_title = decode_codec_text(&mut reader, MAX_TITLE_BYTES)?;
-    let (title_stack, title_stack_position) = if version == OSC_CODEC_VERSION {
+    let (title_stack, title_stack_position) = if version >= OSC_CODEC_VERSION {
         decode_codec_title_stack(&mut reader)?
     } else {
         // Preflight accepts legacy V1 only when both independent stacks are
@@ -1482,6 +1695,8 @@ fn decode_osc_snapshot_v2(bytes: &[u8]) -> Result<OscState, OscCodecError> {
     }
     debug_assert!(reader.is_empty());
     Ok(OscState {
+        theme_scheme: 0,
+        color_overrides: [0; 33],
         baseline: OscBaseline {
             palette: baseline_palette,
             foreground: baseline_foreground,
@@ -1492,6 +1707,8 @@ fn decode_osc_snapshot_v2(bytes: &[u8]) -> Result<OscState, OscCodecError> {
         foreground,
         background,
         cursor,
+        selection_background,
+        color_aliases,
         icon_title,
         window_title,
         title_stack,
@@ -1500,6 +1717,22 @@ fn decode_osc_snapshot_v2(bytes: &[u8]) -> Result<OscState, OscCodecError> {
         current_hyperlink: (current_reference != 0).then_some(HyperlinkRef(current_reference)),
         hyperlink_total_bytes,
     })
+}
+
+fn decode_color_aliases(
+    reader: &mut OscCodecReader<'_>,
+) -> Result<[Option<u16>; 4], OscCodecError> {
+    let mut aliases = [None; 4];
+    for (offset, alias) in aliases.iter_mut().enumerate() {
+        let value = reader.u16()?;
+        if value != u16::MAX {
+            if value > 257 || value == 256 + (offset % 2) as u16 {
+                return Err(OscCodecError::Malformed);
+            }
+            *alias = Some(value);
+        }
+    }
+    Ok(aliases)
 }
 
 fn decode_codec_palette(
@@ -2825,6 +3058,7 @@ mod tests {
     fn snapshot_v2_codec_accepts_exact_total_cap_and_rejects_cap_plus_one() {
         let title = vec![b't'; MAX_TITLE_BYTES];
         let mut state = OscState::default();
+        state.apply(17, b"#123456").unwrap();
         state.apply(0, &title).expect("maximum current titles");
         for _ in 0..MAX_TITLE_STACK_DEPTH {
             state

@@ -192,6 +192,7 @@ enum PrivateMode {
     KeypadApplication,
     LeftRightMargin,
     FocusReporting,
+    AlternateScroll,
     BracketedPaste,
     GraphemeClustering,
     ColorSchemeReporting,
@@ -218,6 +219,7 @@ impl PrivateMode {
             66 => Some(Self::KeypadApplication),
             69 => Some(Self::LeftRightMargin),
             1004 => Some(Self::FocusReporting),
+            1007 => Some(Self::AlternateScroll),
             2004 => Some(Self::BracketedPaste),
             2027 => Some(Self::GraphemeClustering),
             2031 => Some(Self::ColorSchemeReporting),
@@ -230,6 +232,11 @@ impl PrivateMode {
 /// Terminal modes whose values affect output processing or input encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ModeState {
+    pub(crate) vt52: bool,
+    pub(crate) iso2022: bool,
+    // 0: configured output profile; 1: accept C1; 2: reject standalone C1.
+    pub(crate) receive_c1: u8,
+    pub(crate) send_c1: bool,
     pub(crate) insert_mode: bool,
     pub(crate) newline_mode: bool,
     pub(crate) origin_mode: bool,
@@ -240,6 +247,7 @@ pub(crate) struct ModeState {
     pub(crate) keypad_application: bool,
     pub(crate) bracketed_paste: bool,
     pub(crate) focus_reporting: bool,
+    pub(crate) alternate_scroll: bool,
     pub(crate) grapheme_clustering: bool,
     pub(crate) color_scheme_reporting: bool,
     pub(crate) win32_input_mode: bool,
@@ -253,6 +261,10 @@ pub(crate) struct ModeState {
 impl Default for ModeState {
     fn default() -> Self {
         Self {
+            vt52: false,
+            iso2022: false,
+            receive_c1: 0,
+            send_c1: false,
             insert_mode: false,
             newline_mode: false,
             origin_mode: false,
@@ -263,6 +275,7 @@ impl Default for ModeState {
             keypad_application: false,
             bracketed_paste: false,
             focus_reporting: false,
+            alternate_scroll: false,
             grapheme_clustering: false,
             color_scheme_reporting: false,
             win32_input_mode: false,
@@ -276,6 +289,9 @@ impl Default for ModeState {
 }
 
 impl ModeState {
+    pub(crate) fn has_traditional_modes(&self) -> bool {
+        self.vt52 || self.iso2022 || self.receive_c1 != 0 || self.send_c1
+    }
     /// Applies an ANSI mode (`SM`/`RM`), returning false for an unknown mode.
     pub(crate) fn set_ansi_mode(&mut self, parameter: u16, enabled: bool) -> bool {
         let Some(mode) = AnsiMode::from_parameter(parameter) else {
@@ -319,6 +335,7 @@ impl ModeState {
             PrivateMode::KeypadApplication => self.keypad_application = enabled,
             PrivateMode::LeftRightMargin => self.left_right_margin = enabled,
             PrivateMode::FocusReporting => self.focus_reporting = enabled,
+            PrivateMode::AlternateScroll => self.alternate_scroll = enabled,
             PrivateMode::BracketedPaste => self.bracketed_paste = enabled,
             PrivateMode::GraphemeClustering => self.grapheme_clustering = enabled,
             PrivateMode::ColorSchemeReporting => self.color_scheme_reporting = enabled,
@@ -358,6 +375,7 @@ impl ModeState {
             PrivateMode::KeypadApplication => self.keypad_application,
             PrivateMode::LeftRightMargin => self.left_right_margin,
             PrivateMode::FocusReporting => self.focus_reporting,
+            PrivateMode::AlternateScroll => self.alternate_scroll,
             PrivateMode::BracketedPaste => self.bracketed_paste,
             PrivateMode::GraphemeClustering => self.grapheme_clustering,
             PrivateMode::ColorSchemeReporting => self.color_scheme_reporting,
@@ -556,6 +574,10 @@ mod tests {
         assert_eq!(
             ModeState::default(),
             ModeState {
+                vt52: false,
+                iso2022: false,
+                receive_c1: 0,
+                send_c1: false,
                 insert_mode: false,
                 newline_mode: false,
                 origin_mode: false,
@@ -566,6 +588,7 @@ mod tests {
                 keypad_application: false,
                 bracketed_paste: false,
                 focus_reporting: false,
+                alternate_scroll: false,
                 grapheme_clustering: false,
                 color_scheme_reporting: false,
                 win32_input_mode: false,

@@ -1,3 +1,4 @@
+pub(crate) use crate::history_frame::validate as validate_history_frame;
 use std::cmp::Ordering;
 
 use crate::osc::{
@@ -10,13 +11,16 @@ use crate::{Attributes, Cell, Color, CursorShape, Terminal, TerminalError, Under
 pub const RENDER_FRAME_V1_FORMAT_VERSION: u32 = 1;
 pub const RENDER_FRAME_V2_FORMAT_VERSION: u32 = 2;
 pub const RENDER_FRAME_V3_FORMAT_VERSION: u32 = 3;
+pub const RENDER_FRAME_V4_FORMAT_VERSION: u32 = 4;
 pub const MAX_RENDER_FRAME_V1_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RENDER_FRAME_V2_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RENDER_FRAME_V3_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_RENDER_FRAME_V4_BYTES: usize = 32 * 1024 * 1024;
 
 const MAGIC_V1: &[u8; 8] = b"TLRFRM1\0";
 const MAGIC_V2: &[u8; 8] = b"TLRFRM2\0";
 const MAGIC_V3: &[u8; 8] = b"TLRFRM3\0";
+const MAGIC_V4: &[u8; 8] = b"TLRFRM4\0";
 const HEADER_BYTES: usize = 96;
 const DIRECTORY_ENTRY_BYTES: usize = 24;
 const SECTION_COUNT: usize = 6;
@@ -26,6 +30,7 @@ const WIDTH_PROFILE_V1: u32 = 1;
 const REQUIRED_FEATURES_V1: u64 = 0x1f;
 const REQUIRED_FEATURES_V2: u64 = 0x3f;
 const REQUIRED_FEATURES_V3: u64 = 0x7f;
+const REQUIRED_FEATURES_V4: u64 = 0x7ff;
 
 const GRAPHEME_TAG: u32 = 1;
 const RENDITION_TAG: u32 = 2;
@@ -38,6 +43,7 @@ const GRAPHEME_RECORD_BYTES: usize = 8;
 const RENDITION_RECORD_BYTES: usize = 16;
 const PALETTE_RECORD_BYTES: usize = 4;
 const PALETTE_RECORDS: usize = 259;
+const PALETTE_RECORDS_V4: usize = 264;
 const HYPERLINK_RECORD_BYTES: usize = 16;
 const ROWS_CELLS_PREFIX_BYTES: usize = 8;
 const ROW_RECORD_BYTES: usize = 8;
@@ -62,12 +68,17 @@ const _: () = assert!(MAX_CANONICAL_RENDER_FRAME_BYTES == 13_395_208);
 const _: () = assert!(MAX_CANONICAL_RENDER_FRAME_BYTES <= MAX_RENDER_FRAME_V1_BYTES);
 const _: () = assert!(MAX_CANONICAL_RENDER_FRAME_BYTES <= MAX_RENDER_FRAME_V2_BYTES);
 const _: () = assert!(MAX_CANONICAL_RENDER_FRAME_BYTES <= MAX_RENDER_FRAME_V3_BYTES);
+const MAX_CANONICAL_RENDER_FRAME_V4_BYTES: usize =
+    MAX_CANONICAL_RENDER_FRAME_BYTES + (48 - crate::MAX_GRAPHEME_BYTES) * crate::MAX_CELLS + 24;
+const _: () = assert!(MAX_CANONICAL_RENDER_FRAME_V4_BYTES == 22_308_128);
+const _: () = assert!(MAX_CANONICAL_RENDER_FRAME_V4_BYTES <= MAX_RENDER_FRAME_V4_BYTES);
 
 #[derive(Clone, Copy)]
 enum FrameVersion {
     V1,
     V2,
     V3,
+    V4,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -119,22 +130,47 @@ pub(crate) fn export_v3(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
     Ok(bytes)
 }
 
+pub(crate) fn export_v4(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
+    let bytes = export_version(terminal, FrameVersion::V4)?;
+    validate_v4_header(&bytes)?;
+    Ok(bytes)
+}
+
 pub(crate) fn export_v3_at_scrollback(
     terminal: &Terminal,
     offset_rows: u32,
 ) -> Result<Vec<u8>, TerminalError> {
+    export_at_scrollback(terminal, offset_rows, FrameVersion::V3)
+}
+
+pub(crate) fn export_v4_at_scrollback(
+    terminal: &Terminal,
+    offset_rows: u32,
+) -> Result<Vec<u8>, TerminalError> {
+    export_at_scrollback(terminal, offset_rows, FrameVersion::V4)
+}
+
+fn export_at_scrollback(
+    terminal: &Terminal,
+    offset_rows: u32,
+    version: FrameVersion,
+) -> Result<Vec<u8>, TerminalError> {
     terminal.ensure_presentation_eligible()?;
     crate::validate_dimensions(terminal.columns, terminal.rows)?;
 
-    let screen = terminal.active_screen();
+    let screen = terminal.visible_screen();
     if screen.columns != terminal.columns || screen.rows != terminal.rows {
         return Err(TerminalError::MalformedSnapshot);
     }
 
     let window = screen.render_window(offset_rows);
     window.validate()?;
-    let bytes = export_version_with_screen(terminal, &window, false, FrameVersion::V3)?;
-    validate_v3_header(&bytes)?;
+    let bytes = export_version_with_screen(terminal, &window, false, version)?;
+    if matches!(version, FrameVersion::V4) {
+        validate_v4_header(&bytes)?;
+    } else {
+        validate_v3_header(&bytes)?;
+    }
     Ok(bytes)
 }
 
@@ -142,13 +178,37 @@ fn export_version(terminal: &Terminal, version: FrameVersion) -> Result<Vec<u8>,
     terminal.ensure_presentation_eligible()?;
     crate::validate_dimensions(terminal.columns, terminal.rows)?;
 
-    let screen = terminal.active_screen();
+    let screen = terminal.visible_screen();
     if screen.columns != terminal.columns || screen.rows != terminal.rows {
         return Err(TerminalError::MalformedSnapshot);
     }
     screen.validate()?;
 
-    export_version_with_screen(terminal, screen, terminal.cursor_visible, version)
+    export_version_with_screen(
+        terminal,
+        screen,
+        terminal.cursor_visible && terminal.active_page() == terminal.visible_page(),
+        version,
+    )
+}
+
+pub(crate) fn export_history_rows(
+    terminal: &Terminal,
+    first: u32,
+    count: u32,
+) -> Result<Vec<u8>, TerminalError> {
+    crate::validate_dimensions(terminal.columns, count)?;
+    if first
+        .checked_add(count)
+        .is_none_or(|end| end > terminal.main.viewport_top())
+    {
+        return Err(TerminalError::InvalidDimensions);
+    }
+    let window = terminal.main.render_range(first, count);
+    window.validate()?;
+    let bytes = export_version_with_screen(terminal, &window, false, FrameVersion::V4)?;
+    validate_v4_header(&bytes)?;
+    Ok(bytes)
 }
 
 fn export_version_with_screen(
@@ -157,6 +217,35 @@ fn export_version_with_screen(
     cursor_visible: bool,
     version: FrameVersion,
 ) -> Result<Vec<u8>, TerminalError> {
+    if terminal.graphics.is_some() {
+        return Err(TerminalError::RenderFrameVersionRequired);
+    }
+    export_text_with_screen(terminal, screen, cursor_visible, version)
+}
+
+pub(crate) fn export_v4_text_layer(
+    terminal: &Terminal,
+    screen: &Screen,
+    cursor_visible: bool,
+) -> Result<Vec<u8>, TerminalError> {
+    terminal.ensure_presentation_eligible()?;
+    screen.validate()?;
+    export_text_with_screen(terminal, screen, cursor_visible, FrameVersion::V4)
+}
+
+fn export_text_with_screen(
+    terminal: &Terminal,
+    screen: &Screen,
+    cursor_visible: bool,
+    version: FrameVersion,
+) -> Result<Vec<u8>, TerminalError> {
+    if (terminal.width_profile() != crate::WidthProfile::LegacyV1
+        || screen.has_line_renditions()
+        || terminal.osc.has_extended_colors())
+        && !matches!(version, FrameVersion::V4)
+    {
+        return Err(TerminalError::RenderFrameVersionRequired);
+    }
     let graphemes = collect_graphemes(screen)?;
     let renditions = collect_renditions(screen, version)?;
     let hyperlinks = collect_visible_hyperlinks(terminal, screen)?;
@@ -179,7 +268,7 @@ fn collect_graphemes(screen: &Screen) -> Result<Vec<GraphemeRef<'_>>, TerminalEr
         .map_err(|_| TerminalError::LimitExceeded)?;
     for cell in visible_cells {
         if !cell.continuation {
-            if !(1..=crate::MAX_GRAPHEME_BYTES).contains(&cell.grapheme_bytes())
+            if !(1..=screen.width_profile.max_grapheme_bytes()).contains(&cell.grapheme_bytes())
                 || !matches!(cell.width, 1 | 2)
             {
                 return Err(TerminalError::MalformedSnapshot);
@@ -257,7 +346,12 @@ fn encode_frame(
         grapheme_blob_bytes,
     )?;
     let rendition_bytes = checked_mul(renditions.len(), RENDITION_RECORD_BYTES)?;
-    let palette_bytes = checked_mul(PALETTE_RECORDS, PALETTE_RECORD_BYTES)?;
+    let palette_records = if matches!(version, FrameVersion::V4) {
+        PALETTE_RECORDS_V4
+    } else {
+        PALETTE_RECORDS
+    };
+    let palette_bytes = checked_mul(palette_records, PALETTE_RECORD_BYTES)?;
     let hyperlink_blob_bytes = hyperlinks.iter().try_fold(0_usize, |length, &value| {
         let link = terminal
             .osc
@@ -299,7 +393,7 @@ fn encode_frame(
     let counts = [
         checked_u32(graphemes.len())?,
         checked_u32(renditions.len())?,
-        PALETTE_RECORDS as u32,
+        palette_records as u32,
         checked_u32(hyperlinks.len())?,
         checked_u32(visible_cells.len())?,
         checked_u32(title.len())?,
@@ -339,6 +433,7 @@ fn encode_frame(
         FrameVersion::V1 => MAX_RENDER_FRAME_V1_BYTES,
         FrameVersion::V2 => MAX_RENDER_FRAME_V2_BYTES,
         FrameVersion::V3 => MAX_RENDER_FRAME_V3_BYTES,
+        FrameVersion::V4 => MAX_RENDER_FRAME_V4_BYTES,
     };
     if total > maximum {
         return Err(TerminalError::LimitExceeded);
@@ -417,6 +512,18 @@ fn encode_palette(bytes: &mut [u8], desc: SectionDesc, terminal: &Terminal) {
         patch_u32(bytes, offset, osc_color(color));
         offset += PALETTE_RECORD_BYTES;
     }
+    if desc.count as usize == PALETTE_RECORDS_V4 {
+        patch_u32(
+            bytes,
+            offset,
+            osc_color(terminal.osc.selection_background()),
+        );
+        offset += 4;
+        for alias in terminal.osc.color_aliases() {
+            patch_u32(bytes, offset, alias.map_or(u32::MAX, u32::from));
+            offset += 4;
+        }
+    }
     debug_assert_eq!(offset, desc.offset as usize + desc.length as usize);
 }
 
@@ -468,7 +575,8 @@ fn encode_rows_cells(
         patch_u32(
             bytes,
             record + 4,
-            u32::from(screen.soft_wrapped[stored_row]),
+            u32::from(screen.soft_wrapped[stored_row])
+                | ((screen.line_renditions[stored_row] as u32) << 1),
         );
     }
 
@@ -505,7 +613,9 @@ fn encode_directory(bytes: &mut [u8], descs: &[SectionDesc; SECTION_COUNT], vers
     for (index, desc) in descs.iter().copied().enumerate() {
         let base = HEADER_BYTES + index * DIRECTORY_ENTRY_BYTES;
         patch_u32(bytes, base, desc.tag);
-        let section_version = if matches!(version, FrameVersion::V3) && desc.tag == RENDITION_TAG {
+        let section_version = if matches!(version, FrameVersion::V3 | FrameVersion::V4)
+            && desc.tag == RENDITION_TAG
+        {
             2
         } else {
             1
@@ -531,6 +641,7 @@ fn encode_header(
         FrameVersion::V1 => (MAGIC_V1, 1, REQUIRED_FEATURES_V1),
         FrameVersion::V2 => (MAGIC_V2, 2, REQUIRED_FEATURES_V2),
         FrameVersion::V3 => (MAGIC_V3, 3, REQUIRED_FEATURES_V3),
+        FrameVersion::V4 => (MAGIC_V4, 4, REQUIRED_FEATURES_V4),
     };
     patch_bytes(bytes, 0, magic);
     patch_u16(bytes, 8, major);
@@ -538,14 +649,19 @@ fn encode_header(
     patch_u16(bytes, 12, HEADER_BYTES as u16);
     patch_u16(bytes, 14, DIRECTORY_ENTRY_BYTES as u16);
     patch_u16(bytes, 16, SECTION_COUNT as u16);
-    let frame_flags =
+    let mut frame_flags =
         u16::from(terminal.active_alternate) | (u16::from(terminal.modes.reverse_video) << 1);
+    if matches!(version, FrameVersion::V4) {
+        frame_flags |=
+            u16::from(terminal.modes.mouse_tracking != crate::modes::MouseTracking::None) << 2;
+        frame_flags |= u16::from(terminal.active_alternate && terminal.modes.alternate_scroll) << 3;
+    }
     patch_u16(bytes, 18, frame_flags);
     patch_u32(bytes, 20, checked_u32(total)?);
     patch_u64(bytes, 24, terminal.next_source_sequence);
     patch_u64(bytes, 32, terminal.next_source_sequence);
-    patch_u32(bytes, 40, terminal.columns);
-    patch_u32(bytes, 44, terminal.rows);
+    patch_u32(bytes, 40, screen.columns);
+    patch_u32(bytes, 44, screen.rows);
     patch_u32(bytes, 48, screen.cursor_row);
     patch_u32(bytes, 52, screen.cursor_column);
     patch_u32(
@@ -553,9 +669,12 @@ fn encode_header(
         56,
         u32::from(cursor_visible) | (u32::from(screen.wrap_pending) << 1),
     );
-    patch_u32(bytes, 60, WIDTH_PROFILE_V1);
+    patch_u32(bytes, 60, terminal.width_profile() as u32);
     patch_u32(bytes, 64, HEADER_BYTES as u32);
-    if matches!(version, FrameVersion::V2 | FrameVersion::V3) {
+    if matches!(
+        version,
+        FrameVersion::V2 | FrameVersion::V3 | FrameVersion::V4
+    ) {
         bytes[68] = terminal.cursor_shape as u8;
         bytes[69] = u8::from(terminal.cursor_blinking);
     }
@@ -612,23 +731,40 @@ fn validate_v2_header(bytes: &[u8]) -> Result<(), TerminalError> {
 }
 
 pub(crate) fn validate_v3_header(bytes: &[u8]) -> Result<(), TerminalError> {
+    validate_modern_header(bytes, false)
+}
+
+pub(crate) fn validate_v4_header(bytes: &[u8]) -> Result<(), TerminalError> {
+    validate_modern_header(bytes, true)
+}
+
+fn validate_modern_header(bytes: &[u8], v4: bool) -> Result<(), TerminalError> {
     if bytes.len() < HEADER_BYTES {
         return Err(TerminalError::MalformedSnapshot);
     }
-    if &bytes[..8] != MAGIC_V3
-        || read_u16(bytes, 8)? != RENDER_FRAME_V3_FORMAT_VERSION as u16
+    if &bytes[..8] != if v4 { MAGIC_V4 } else { MAGIC_V3 }
+        || read_u16(bytes, 8)? != if v4 { 4 } else { 3 }
         || read_u16(bytes, 10)? != 0
         || read_u16(bytes, 12)? != HEADER_BYTES as u16
         || read_u16(bytes, 14)? != DIRECTORY_ENTRY_BYTES as u16
         || read_u16(bytes, 16)? != SECTION_COUNT as u16
-        || read_u32(bytes, 60)? != WIDTH_PROFILE_V1
+        || !if v4 {
+            matches!(read_u32(bytes, 60)?, 1 | 2)
+        } else {
+            read_u32(bytes, 60)? == WIDTH_PROFILE_V1
+        }
         || read_u32(bytes, 64)? != HEADER_BYTES as u32
-        || read_u64(bytes, 72)? != REQUIRED_FEATURES_V3
+        || read_u64(bytes, 72)?
+            != if v4 {
+                REQUIRED_FEATURES_V4
+            } else {
+                REQUIRED_FEATURES_V3
+            }
     {
         return Err(TerminalError::IncompatibleSnapshot);
     }
     if read_u32(bytes, 20)? as usize != bytes.len()
-        || read_u16(bytes, 18)? & !3 != 0
+        || read_u16(bytes, 18)? & !(if v4 { 15 } else { 3 }) != 0
         || read_u32(bytes, 56)? & !3 != 0
         || bytes[68] > CursorShape::Bar as u8
         || bytes[69] > 1
@@ -645,7 +781,7 @@ pub(crate) fn validate_v3_header(bytes: &[u8]) -> Result<(), TerminalError> {
     let cursor_flags = read_u32(bytes, 56)?;
     if cursor_row >= rows
         || cursor_column >= columns
-        || (cursor_flags & 2 != 0 && cursor_column != columns - 1)
+        || (!v4 && cursor_flags & 2 != 0 && cursor_column != columns - 1)
         || crate::crc32c::checksum(&bytes[HEADER_BYTES..]) != read_u32(bytes, 88)?
         || crate::crc32c::checksum(&bytes[..92]) != read_u32(bytes, 92)?
     {
@@ -812,7 +948,7 @@ fn rendition_bytes(attributes: Attributes, version: FrameVersion) -> [u8; RENDIT
         | (u32::from(underline_present) << 4)
         | (u32::from(attributes.conceal) << 5)
         | (u32::from(attributes.strikethrough) << 6)
-        | if matches!(version, FrameVersion::V3) {
+        | if matches!(version, FrameVersion::V3 | FrameVersion::V4) {
             (u32::from(attributes.faint) << 7)
                 | (u32::from(attributes.overline) << 8)
                 | (u32::from(attributes.underline_style as u8) << RENDITION_UNDERLINE_STYLE_SHIFT)
@@ -822,7 +958,7 @@ fn rendition_bytes(attributes: Attributes, version: FrameVersion) -> [u8; RENDIT
     bytes[..4].copy_from_slice(&flags.to_le_bytes());
     bytes[4..8].copy_from_slice(&packed_color(attributes.foreground).to_le_bytes());
     bytes[8..12].copy_from_slice(&packed_color(attributes.background).to_le_bytes());
-    if matches!(version, FrameVersion::V3) {
+    if matches!(version, FrameVersion::V3 | FrameVersion::V4) {
         bytes[12..16].copy_from_slice(&packed_color(attributes.underline_color).to_le_bytes());
     }
     bytes
@@ -855,8 +991,16 @@ fn osc_color(color: Option<crate::OscColor>) -> u32 {
 
 fn grapheme_ref(cell: &Cell) -> GraphemeRef<'_> {
     GraphemeRef {
-        character: cell.character,
-        combining: &cell.combining,
+        character: if cell.glyph.is_some() {
+            '\u{fffd}'
+        } else {
+            cell.character
+        },
+        combining: if cell.glyph.is_some() {
+            ""
+        } else {
+            &cell.combining
+        },
         width: cell.width,
     }
 }
@@ -927,6 +1071,32 @@ mod tests {
             u32_at(bytes, directory + 8) as usize,
             u32_at(bytes, directory + 12) as usize,
         )
+    }
+
+    #[test]
+    fn v4_mouse_routing_flags_follow_committed_modes_without_changing_legacy_frames() {
+        let mut terminal = Terminal::new(10, 5).unwrap();
+        for (output, expected) in [
+            ("\x1b[?1003;1006h", 4),
+            ("\x1b[?1007h", 4),
+            ("\x1b[?1049h", 13),
+            ("\x1b[?1003l", 9),
+            ("\x1b[?1007l", 1),
+            ("\x1bc", 0),
+        ] {
+            terminal
+                .apply_event(Event::Output {
+                    source_sequence: terminal.next_source_sequence(),
+                    bytes: output.as_bytes(),
+                })
+                .unwrap();
+            let frame = terminal.export_render_frame_v4().unwrap();
+            assert_eq!(u16_at(&frame, 18), expected);
+            assert_eq!(
+                u16_at(&terminal.export_render_frame_v3().unwrap(), 18),
+                expected & 3
+            );
+        }
     }
 
     fn terminal_with_hidden_history() -> Terminal {

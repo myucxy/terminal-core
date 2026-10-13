@@ -1,6 +1,10 @@
 pub(super) fn checksum(bytes: &[u8]) -> u32 {
+    checksum_parts(&[bytes])
+}
+
+pub(super) fn checksum_parts(parts: &[&[u8]]) -> u32 {
     let mut crc = !0_u32;
-    for &byte in bytes {
+    for &byte in parts.iter().flat_map(|part| part.iter()) {
         crc ^= u32::from(byte);
         for _ in 0..8 {
             let mask = 0_u32.wrapping_sub(crc & 1);

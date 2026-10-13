@@ -1,14 +1,30 @@
 # TermLink 自研终端核心：未实现能力与实施路线
 
-更新日期：2026-08-28
+2026-10-10 更新：本页下方为初始缺口与验收要求，DRCS/SIXEL/Kitty/Delta 等已有后续实现，不能继续按本表推断当前 parser 行为。当前已验证层级及未完成整合见 [最新整合状态](INTEGRATION_STATUS_20261010.md)。
+
+更新日期：2026-10-09
 
 本文记录 `terminal-core` 当前明确未实现的能力、没有采用“半实现”的原因、实现依赖和完成标准。
 它是工程路线记录，不表示这些能力已经进入产品，也不能替代对应协议的测试和验收证据。
 
-> 状态说明（2026-08-30）：Windows 与 Android 的生产 authority/render 主链已经接入 native core。
-> 本文尾部仍存在 Windows-first/shadow 阶段的历史平台描述，统一清理工作已记录在
-> [`DEVELOPMENT_ROADMAP.md`](DEVELOPMENT_ROADMAP.md) 的 W0；本文所列 History Page、Delta、
-> DRCS、SIXEL 和 Kitty graphics 技术缺口仍然有效。
+2026-10-09 用户已要求补齐上一轮全部未实现/部分实现项。当前全量范围（22 组）、依赖、
+分阶段实施及测试/复核流程见 [全量能力计划](FULL_CAPABILITY_IMPLEMENTATION_PLAN_20261009.md)。
+本文的协议要求继续有效；后续“按需推进”不再表示可以省略该计划内的低优先级能力。
+
+S1 首批代码与本地验证见 [诊断与编辑实现记录](S1_DIAGNOSTICS_EDITING_20261009.md)：
+C02 已有跨 core/FFI/JNI/.NET 的安全错误详情；C05 的 ESC 6/9、CSI ?5W 已实现并测试。
+尚未完成的查询分类、精细参数定位、产品 Relay 联测及其他 22 组范围不因此关闭。
+
+后续 DEV 进展：C03 的 Unicode 16/profile 2、Snapshot 2.12、Render V4 及双端绑定和 Android
+字素绘制已实现，见 [Unicode 记录](S1_S4_REPORTS_UNICODE_BASELINE_20261009.md)；C04 的行属性、
+Snapshot 2.13 与 Android 双宽/双高绘制见 [行属性记录](S2_LINE_RENDITIONS_20261009.md)。
+两项已有 opt-in Windows 原生展示；profile 附着协商及产品级 Relay 验收尚未完成。
+Windows 原生窗口、鼠标路由、手机尺寸调整及 C14 颜色接入进展见 [最新开发记录](S2_COLORS_NATIVE_DISPLAY_20261009.md)。
+E04 主题查询/2031、有序配色与显式颜色归属已完成本地 core/绑定/双端显示/历史验证，见 [主题记录](S2_HOST_THEME_20261010.md)；产品 Relay 与全量验收仍未完成。
+
+> 状态说明（2026-10-09）：Windows 与 Android 的生产 authority/render 主链已经接入 native core。
+> 旧路线图仍保留历史阶段待办，不能直接用旧勾选状态判断当前能力。本文所列 History Page、Delta、
+> DRCS、SIXEL 和 Kitty graphics 技术缺口仍然有效；当前优先修复下列 P0 查询兼容问题。
 
 ## 基本原则
 
@@ -16,7 +32,8 @@
   或其他终端核心。外部实现只能作为公开行为的对照样本。
 - 所有输入、缓存、图片、字形、分页和增量数据必须有明确上限，并在失败时保持事件原子性。
 - 不能把“识别 introducer”或“解析部分参数”声明为协议支持。缺少状态、持久化、渲染或生命周期
-  管理时，应明确 fail closed 或返回 unsupported。
+  管理时须标明不支持；只读能力查询和可选提示应有精确的兼容/拒绝策略，不应一律升级为终端
+  不可恢复错误。序号错误、损坏快照、未知必要状态仍保留一致性保护。
 - 新状态必须同时考虑 Snapshot、C ABI、.NET、Android contract、恢复重放和旧版本 byte stability。
 - 跨平台 `cargo check` 只证明源码可编译，不等同于平台运行、渲染或产品接入已完成。
 
@@ -24,13 +41,42 @@
 
 | 能力 | 当前已有基础 | 仍缺少的完整能力 | 当前行为 |
 |---|---|---|---|
-| History Page | 有界 runtime scrollback、行 ID/revision、Snapshot V2.10 retained primary scrollback | immutable capture、分页 token、anchor、sealed logical line、截断和 stale 语义 | 检查点可恢复历史，但无对外分页历史 API |
+| P0 窗口尺寸查询兼容 | 本轮 DEV 已补 14/15/16/18/19t 降级、18t 权威字符行列回复及外层回复分类 | 产品 Relay 联测、clean 双端升级；完整共享像素定义留待后续 | 修复版真实故障 WAL 36/36 通过，旧安装包仍有原问题 |
+| P0 可选查询错误分类 | 对已知只读几何查询数值变体安全降级；原子应用、序号和 Snapshot 校验保留 | 其他只读查询族逐项定义策略，记录拒绝原因及隔离范围 | 未知有状态指令仍可 Unsupported / FailedClosed，没有一律忽略 |
+| History Page | 冻结 capture、sealed 整行分页/token/anchor/截断、严格解码、双端本地滚动及过期/资源限额 | H01 标记、图形资源、远端分页 RPC、持久 transcript 与产品 Relay 验收 | additive C/JNI/.NET API 已本地验证，见 [S5 记录](S5_IMMUTABLE_HISTORY_20261010.md) |
 | Delta | 有 presentation revision、Snapshot 和 Render Frame | dirty journal、稳定资源 ID、tombstone、base/target revision、gap/resync | 预留入口返回 unsupported |
 | DRCS | DCS 分派、G0–G3、NRC/charset 状态、Snapshot | DECDLD/DRCS 解析、字形仓库、映射、持久化、跨平台 glyph 渲染 | 已知有状态序列 fail closed |
 | SIXEL | DCS 边界、流式 parser 基础、Host Effect 通道 | SIXEL rasterizer、颜色寄存器、画布、图片资源和合成 | SIXEL dispatch fail closed |
 | Kitty graphics | APC 边界；Kitty Keyboard Input V3 已实现 | graphics chunk、压缩/传输、image/placement ID、查询/删除、合成和回复 | APC payload 不作为 graphics 执行 |
 
+## P0：Claude 启动查询导致会话退出（2026-10-09，首批 DEV 已修复）
+
+实现、实测及剩余验收见 [本轮修复记录](QUERY_COMPATIBILITY_FIX_20261009.md)。下面保留原始根因和验收清单。
+
+- `[!]` 实际会话第 34 条输出包含 `CSI 16 t`（字符单元像素查询），当前核心返回 Unsupported。
+  Windows SessionHost 随后以 125 结束 shell，安卓同一输出回放报 TL-H122。
+- `[x]` 建立整个窗口尺寸查询族的明确矩阵，优先 `16t`、`18t`；不只在某个客户端过滤这一串字节。
+- `[x]` 对 `18t` 使用核心实际字符行列数；对像素/屏幕几何采用无回复
+  回退。不得把 Windows Terminal 的 Sixel 虚拟 10×20 像素误报为手机或 Windows 的真实字体尺寸。
+- `[x]` 同步应用仓库 `OuterTerminalReplySuppressor`，覆盖几何回复 4/5/6/8/9，18t 按源坐标归属去重。
+- `[x]` Android 镜像回放和 Windows 权威核心一起验证；核心 DLL 和四 ABI SO 统一构建导出为 DEV。
+- `[x]` 分块、组合查询、后续普通文本、参数变体、快照后缀回放、回复去重及不误抢本地控制的针对性测试。
+- `[x]` 隔离真实 PowerShell→Claude 启动→中断→PowerShell 仍可输入并正常退出。
+- `[ ]` 更新双端后的手机主 App → Relay 产品联测、clean 库和正式升级。仅服务器转发，无 LAN/NAT 门禁。
+
+证据：应用仓库本机 `artifacts/validation/claude-cli-diagnosis-20261009*.json`、
+`terminal-query-family-probes-20261009.json`、`claude-cli-geometry-reply-probe-20261009.json`。
+36 条原始事件在安装 DLL/当前锁定 DLL 上均于同一查询失败；仅在内存测试副本移除 `16t` 后全部通过。
+这是定位证据，不是产品修复；原历史、二进制和源码 revision 没有因此改变。
+
+与 Windows Terminal 的分项复核及计数见 [2026-10-09 能力对照](WINDOWS_TERMINAL_CAPABILITY_REVIEW_20261009.md)。
+修复前固定清单确认 18 组差距（14 组核心、4 组跨平台；8 组部分实现、10 组缺失），不代表全功能总数或修复后的重新计数。
+DECSTR 及准确的 2027/2031 声明已在首批 DEV 完成；后续仍包括完整字素、主题报告、其余编辑、shell cwd/命令标记、OSC 52 和终端进度/铃声。
+能力对照中的 C01–C14、H01–H04 为接续 ID，E01–E04 为不计入对比数量的工程待办。
+
 ## 1. History Page
+
+2026-10-10：文字阶段已实现下列 capture、token、预算、FFI/decoder 和本地浏览要求；详见 [实现记录](S5_IMMUTABLE_HISTORY_20261010.md)。仍须后续加入标记/图形及产品链路，以下作为完整能力要求保留。
 
 ### 为什么当前 scrollback 不等于 History Page
 
@@ -139,6 +185,9 @@ Kitty Keyboard Input V3 已实现，但它与 Kitty graphics 是两套独立协�
 
 ## 推荐实施顺序
 
+先处理上述 **P0 查询兼容与错误分类**，再按全量计划 S0–S8 完成所有既定能力。
+以下为 API/资源部分的依赖说明，不替代全量计划的阶段顺序；Delta 的最终验收须覆盖新增页/字形/图像状态。
+
 1. History Page V1：先建立稳定、可分页的历史读取语义。
 2. Delta V2：建立 revision、dirty journal、gap 和 full-resync 机制。
 3. DRCS：先贯通小型 renderer resource、Snapshot 和 glyph 生命周期。
@@ -151,7 +200,8 @@ Kitty graphics 共用图像存储、placement、合成和回收。按此顺序�
 
 ## 产品与平台边界
 
-- 当前 Windows 生产 renderer/journal 尚未切换到自研核心。
-- Android renderer contract、JNI/NDK `.so`、自研 terminal View 和设备运行验收均未纳入本次 Windows-first 提交。
+- Windows SessionHost 的终端权威与 Android native render 主链已经使用自研核心；早期 Windows-first
+  状态不再代表当前实现。Windows 可见窗口仍经外层终端投射，因此回复过滤属于应用宿主边界。
+- JNI/NDK、自有 terminal View 已存在。新能力仍须更新对应状态/资源契约并分别完成设备验收。
 - 因此上述能力即使先在 Rust 中完成 parser，也必须等到平台渲染、真实 binding 和 E2E 恢复链通过后，
   才能标记为产品已支持。

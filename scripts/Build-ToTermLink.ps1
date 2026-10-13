@@ -27,6 +27,27 @@ function Read-Git([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read core source revision/state.' }
     return $result
 }
+function Get-SourceFingerprint {
+    # Git lists tracked paths even when deleted and nonignored untracked paths.
+    # NUL delimiters preserve names containing whitespace or newlines.
+    $raw = (& git -C $core ls-files --cached --others --exclude-standard -z) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate core source files.' }
+    $paths = @($raw.Split([char]0, [StringSplitOptions]::RemoveEmptyEntries) | Sort-Object -CaseSensitive)
+    $records = [Text.StringBuilder]::new()
+    foreach ($relative in $paths) {
+        $path = Join-Path $core $relative
+        $hash = if (Test-Path -LiteralPath $path -PathType Leaf) {
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        } elseif (Test-Path -LiteralPath $path) {
+            throw "Core source path is not a file: $relative"
+        } else {
+            'MISSING'
+        }
+        [void]$records.Append($relative.Length).Append(':').Append($relative).Append(':').Append($hash).Append("`n")
+    }
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+        [Text.Encoding]::UTF8.GetBytes($records.ToString())))
+}
 
 $revision = (Read-Git @('rev-parse', 'HEAD')).Trim()
 $dirty = @(Read-Git @('status', '--porcelain', '--untracked-files=normal')).Count -ne 0
@@ -37,6 +58,7 @@ foreach ($tool in @($CargoPath, $AndroidCargoPath, $CMakePath, $NinjaPath,
 }
 $androidCargoVersion = & $AndroidCargoPath --version
 if ($LASTEXITCODE -ne 0 -or $androidCargoVersion -notmatch '^cargo 1\.97\.1\b') { throw 'Android Cargo must be 1.97.1.' }
+$sourceFingerprint = Get-SourceFingerprint
 $dist = Join-Path $core 'dist'
 $artifacts = @()
 Push-Location $core
@@ -70,6 +92,7 @@ foreach ($artifact in $artifacts) {
     $artifact.sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 if ((Read-Git @('rev-parse', 'HEAD')).Trim() -cne $revision -or
+    (Get-SourceFingerprint) -cne $sourceFingerprint -or
     (@(Read-Git @('status', '--porcelain', '--untracked-files=normal')).Count -ne 0) -ne $dirty) {
     throw 'Core checkout changed during build; refusing to export.'
 }

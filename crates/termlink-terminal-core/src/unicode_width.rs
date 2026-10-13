@@ -1,7 +1,5 @@
 //! Fixed, deliberately small Unicode width profile used by Snapshot V2.
 
-pub(crate) const WIDTH_PROFILE_VERSION: u16 = 1;
-
 pub(crate) fn scalar_width(character: char) -> u8 {
     let value = u32::from(character);
     if is_combining(value) {

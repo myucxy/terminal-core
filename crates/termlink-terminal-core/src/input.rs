@@ -479,6 +479,7 @@ impl Modifiers {
 /// An input rejected before any bytes were produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEncodeError {
+    UnsupportedVt52Key(Key),
     TerminalFailedClosed,
     Win32InputModeDisabled,
     /// Legacy semantic keys are ambiguous after Kitty enhancement is active.
@@ -555,15 +556,49 @@ pub(crate) fn encode_input(
     if kitty_flags & !0x1f != 0 {
         return Err(InputEncodeError::InvalidKittyFlags { flags: kitty_flags });
     }
-    match event {
-        InputEvent::Key(_) if kitty_flags != 0 => Err(InputEncodeError::KittyKeyEventRequired),
+    let legacy_modes;
+    let modes = if modes.vt52 {
+        legacy_modes = ModeState {
+            modify_other_keys: ModifyOtherKeys::Disabled,
+            bracketed_paste: false,
+            focus_reporting: false,
+            mouse_tracking: MouseTracking::None,
+            ..*modes
+        };
+        &legacy_modes
+    } else {
+        modes
+    };
+    let protocol_input = !matches!(
+        event,
+        InputEvent::Paste(_)
+            | InputEvent::Key(KeyEvent {
+                key: Key::Character(_),
+                ..
+            })
+            | InputEvent::KittyKey(KittyKeyEvent {
+                key: KittyKey::Character(_) | KittyKey::UnidentifiedText,
+                ..
+            })
+    );
+    let result = match event {
+        InputEvent::Key(_) if kitty_flags != 0 && !modes.vt52 => {
+            Err(InputEncodeError::KittyKeyEventRequired)
+        }
         InputEvent::Key(event) => encode_key(event, modes),
-        InputEvent::KittyKey(event) => encode_kitty_key(event, modes, kitty_flags),
+        InputEvent::KittyKey(event) => {
+            encode_kitty_key(event, modes, if modes.vt52 { 0 } else { kitty_flags })
+        }
         InputEvent::Win32Key(event) => encode_win32_key(event, modes),
         InputEvent::Paste(event) => encode_paste(event, modes),
         InputEvent::Mouse(event) => encode_mouse(event, modes),
         InputEvent::FocusGained => encode_focus(FOCUS_GAINED, modes),
         InputEvent::FocusLost => encode_focus(FOCUS_LOST, modes),
+    }?;
+    if modes.send_c1 && !modes.vt52 && protocol_input {
+        crate::traditional::encode_c1(&result).map_err(|_| InputEncodeError::AllocationFailed)
+    } else {
+        Ok(result)
     }
 }
 
@@ -1345,6 +1380,37 @@ fn encode_focus(sequence: &[u8], modes: &ModeState) -> Result<Vec<u8>, InputEnco
     }
 }
 
+pub(crate) fn encode_alternate_scroll(
+    event: MouseEvent,
+    modes: &ModeState,
+    kitty_flags: u8,
+) -> Result<Vec<u8>, InputEncodeError> {
+    validate_mouse_event(event)?;
+    let key = match event.action {
+        MouseAction::Wheel(MouseWheelDirection::Up) => KittyFunctionalKey::ArrowUp,
+        MouseAction::Wheel(MouseWheelDirection::Down) => KittyFunctionalKey::ArrowDown,
+        _ => return Ok(Vec::new()),
+    };
+    encode_kitty_key(
+        KittyKeyEvent {
+            key: KittyKey::Functional(key),
+            modifiers: KittyModifiers {
+                shift: event.modifiers.shift,
+                alt: event.modifiers.alt,
+                control: event.modifiers.control,
+                meta: event.modifiers.meta,
+                ..KittyModifiers::NONE
+            },
+            event_type: KittyKeyEventType::Press,
+            shifted_key: None,
+            base_layout_key: None,
+            associated_text: "",
+        },
+        modes,
+        kitty_flags,
+    )
+}
+
 fn encode_mouse(event: MouseEvent, modes: &ModeState) -> Result<Vec<u8>, InputEncodeError> {
     validate_mouse_event(event)?;
 
@@ -1542,6 +1608,39 @@ fn push_decimal_u32(output: &mut Vec<u8>, mut value: u32) {
 
 fn encode_key(event: KeyEvent, modes: &ModeState) -> Result<Vec<u8>, InputEncodeError> {
     let KeyEvent { key, modifiers } = event;
+    if modes.vt52 {
+        let final_byte = match key {
+            Key::ArrowUp => Some(b'A'),
+            Key::ArrowDown => Some(b'B'),
+            Key::ArrowRight => Some(b'C'),
+            Key::ArrowLeft => Some(b'D'),
+            Key::Home => Some(b'H'),
+            Key::F1 => Some(b'P'),
+            Key::F2 => Some(b'Q'),
+            Key::F3 => Some(b'R'),
+            Key::F4 => Some(b'S'),
+            Key::Delete => return encode_literal(b"\x7f", modifiers, key),
+            Key::End
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Insert
+            | Key::F5
+            | Key::F6
+            | Key::F7
+            | Key::F8
+            | Key::F9
+            | Key::F10
+            | Key::F11
+            | Key::F12 => return Err(InputEncodeError::UnsupportedVt52Key(key)),
+            _ => None,
+        };
+        if let Some(final_byte) = final_byte {
+            if !modifiers.is_empty() {
+                return Err(InputEncodeError::UnsupportedModifiers { key, modifiers });
+            }
+            return copy_bytes(&[ESC, final_byte]);
+        }
+    }
     if let Some(codepoint) = modify_other_keys_codepoint(event, modes.modify_other_keys) {
         return encode_xterm_modify_other_key(codepoint, modifiers);
     }
@@ -1768,7 +1867,11 @@ fn encode_keypad(
             KeypadKey::Equal => b'X',
             KeypadKey::Enter => b'M',
         };
-        return encode_ss3(final_byte);
+        return if modes.vt52 {
+            copy_bytes(&[ESC, b'?', final_byte])
+        } else {
+            encode_ss3(final_byte)
+        };
     }
 
     let bytes = match keypad_key {
@@ -3282,6 +3385,133 @@ mod tests {
             encode(modified_key(key, modifiers), &modes),
             Err(InputEncodeError::UnsupportedModifiers { key, modifiers })
         );
+    }
+
+    #[test]
+    fn alternate_scroll_uses_the_active_keyboard_protocol_only_without_mouse_tracking() {
+        let wheel = |direction| {
+            mouse(
+                MouseAction::Wheel(direction),
+                MouseButtons::NONE,
+                Modifiers::NONE,
+                0,
+                0,
+                None,
+            )
+        };
+        let mut terminal = crate::Terminal::new(80, 24).unwrap();
+        let feed = |terminal: &mut crate::Terminal, bytes: &[u8]| {
+            terminal
+                .apply_event(crate::Event::Output {
+                    source_sequence: terminal.next_source_sequence(),
+                    bytes,
+                })
+                .unwrap();
+        };
+        feed(&mut terminal, b"\x1b[?1007h");
+        assert!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Up))
+                .unwrap()
+                .is_empty()
+        );
+        feed(&mut terminal, b"\x1b[?1049h");
+        assert_eq!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Up))
+                .unwrap(),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Down))
+                .unwrap(),
+            b"\x1b[B"
+        );
+        assert!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Left))
+                .unwrap()
+                .is_empty()
+        );
+        feed(&mut terminal, b"\x1b[?1h");
+        assert_eq!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Up))
+                .unwrap(),
+            b"\x1bOA"
+        );
+        feed(&mut terminal, b"\x1b[=31u");
+        assert_eq!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Down))
+                .unwrap(),
+            b"\x1b[1;1:1B"
+        );
+        let snapshot = terminal.export_snapshot_v2().unwrap();
+        let restored = crate::Terminal::import_snapshot_v2(&snapshot).unwrap();
+        assert_eq!(
+            restored
+                .encode_input(wheel(MouseWheelDirection::Down))
+                .unwrap(),
+            b"\x1b[1;1:1B"
+        );
+        feed(&mut terminal, b"\x1b[?1000;1006h");
+        assert_eq!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Up))
+                .unwrap(),
+            b"\x1b[<64;1;1M"
+        );
+        feed(&mut terminal, b"\x1b[?1000l\x1b[?9h");
+        assert_eq!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Up))
+                .unwrap(),
+            b"\x1b[<64;1;1M"
+        );
+        feed(&mut terminal, b"\x1b[?9l\x1b[?1007l");
+        assert!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Up))
+                .unwrap()
+                .is_empty()
+        );
+        feed(&mut terminal, b"\x1b[?1007h\x1bc\x1b[?1049h");
+        assert!(
+            terminal
+                .encode_input(wheel(MouseWheelDirection::Up))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn alternate_scroll_checkpoint_and_mode_reply_match_at_every_split() {
+        let input = b"\x1b[?1049h\x1b[?1007h\x1b[?1007$p";
+        for split in 0..=input.len() {
+            let mut terminal = crate::Terminal::new(80, 24).unwrap();
+            let mut replies = Vec::new();
+            for (sequence, part) in [&input[..split], &input[split..]].into_iter().enumerate() {
+                let event = terminal
+                    .prepare_event_with_host_effects_v2(crate::Event::Output {
+                        source_sequence: sequence as u64,
+                        bytes: part,
+                    })
+                    .unwrap();
+                replies.extend(
+                    crate::tests::host_effect_payloads(event.host_effect_frame_v2())
+                        .iter()
+                        .map(|bytes| bytes.to_vec()),
+                );
+                event.publish(|_| Ok::<(), ()>(())).unwrap();
+            }
+            assert_eq!(replies, [b"\x1b[?1007;1$y".to_vec()]);
+            let snapshot = terminal.export_snapshot_v2().unwrap();
+            let restored = crate::Terminal::import_snapshot_v2(&snapshot).unwrap();
+            assert_eq!(restored, terminal);
+            assert_eq!(restored.export_snapshot_v2().unwrap(), snapshot);
+        }
     }
 
     #[test]

@@ -50,6 +50,10 @@ fn take_dcs_query_payload_allocation_failure_for_test() -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Action {
+    Vt52 {
+        command: u8,
+        address: Option<(u8, u8)>,
+    },
     None,
     Print(u8),
     Execute(u8),
@@ -62,6 +66,37 @@ pub(super) enum Sequence {
     Csi(CsiSequence),
     Osc(OscSequence),
     Dcs(DcsSequence),
+    Apc(ApcSequence),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub(super) struct ApcSequence {
+    bytes: Vec<u8>,
+    payload_start: Option<usize>,
+}
+
+impl ApcSequence {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn push(&mut self, byte: u8) -> Result<(), ParseError> {
+        if let Some(start) = self.payload_start {
+            if self.bytes.len() - start == crate::kitty_graphics::MAX_CHUNK_BYTES {
+                return Err(ParseError::ApcPayloadLimit);
+            }
+        } else if byte != b';' && self.bytes.len() == crate::kitty_graphics::MAX_CONTROL_BYTES {
+            return Err(ParseError::ApcHeaderLimit);
+        }
+        self.bytes
+            .try_reserve(1)
+            .map_err(|_| ParseError::ApcAllocation)?;
+        self.bytes.push(byte);
+        if byte == b';' && self.payload_start.is_none() {
+            self.payload_start = Some(self.bytes.len());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,8 +223,12 @@ impl DcsSequence {
 
     fn is_query(&self) -> bool {
         self.private_prefix.is_none()
-            && self.parameter_count == 0
-            && matches!((self.intermediates(), self.final_byte), (b"$" | b"+", b'q'))
+            && ((self.parameter_count == 0
+                && matches!((self.intermediates(), self.final_byte), (b"$" | b"+", b'q')))
+                || matches!(
+                    (self.intermediates(), self.final_byte),
+                    (b"$", b'p' | b't') | (b"!", b'u' | b'z')
+                ))
     }
 
     fn is_sixel(&self) -> bool {
@@ -197,6 +236,14 @@ impl DcsSequence {
             && self.private_prefix.is_none()
             && self.intermediate_count == 0
             && !self.has_subparameters()
+    }
+
+    fn is_graphics(&self) -> bool {
+        self.is_sixel()
+            || (self.private_prefix.is_none()
+                && self.intermediates().is_empty()
+                && self.final_byte == b'{'
+                && !self.has_subparameters())
     }
 
     fn is_known_stateful(&self) -> bool {
@@ -219,7 +266,20 @@ impl DcsSequence {
     }
 
     fn push_query_payload(&mut self, byte: u8) -> Result<(), ParseError> {
-        if self.payload.len() == MAX_DCS_QUERY_PAYLOAD_BYTES {
+        let limit = if self.is_sixel() {
+            crate::sixel::MAX_SIXEL_PAYLOAD_BYTES
+        } else if self.is_graphics() {
+            crate::drcs::MAX_DRCS_PAYLOAD_BYTES
+        } else if matches!((self.intermediates(), self.final_byte), (b"$", b'p' | b't')) {
+            16 * 1024
+        } else if (self.intermediates(), self.final_byte) == (b"!", b'u') {
+            3
+        } else if (self.intermediates(), self.final_byte) == (b"!", b'z') {
+            crate::macros::MAX_ENCODED_BYTES
+        } else {
+            MAX_DCS_QUERY_PAYLOAD_BYTES
+        };
+        if self.payload.len() == limit {
             return Err(ParseError::DcsQueryPayloadLimit);
         }
         if self.payload.len() == self.payload.capacity() {
@@ -227,7 +287,7 @@ impl DcsSequence {
             if take_dcs_query_payload_allocation_failure_for_test() {
                 return Err(ParseError::DcsQueryPayloadAllocation);
             }
-            let remaining = MAX_DCS_QUERY_PAYLOAD_BYTES - self.payload.len();
+            let remaining = limit - self.payload.len();
             self.payload
                 .try_reserve(remaining.min(4096))
                 .map_err(|_| ParseError::DcsQueryPayloadAllocation)?;
@@ -252,6 +312,9 @@ pub(super) enum ParseError {
     OscPayloadAllocation,
     DcsQueryPayloadLimit,
     DcsQueryPayloadAllocation,
+    ApcHeaderLimit,
+    ApcPayloadLimit,
+    ApcAllocation,
 }
 
 impl ParseError {
@@ -270,6 +333,9 @@ impl ParseError {
             Self::OscPayloadAllocation => "OSC payload allocation",
             Self::DcsQueryPayloadLimit => "DCS query payload limit",
             Self::DcsQueryPayloadAllocation => "DCS query payload allocation",
+            Self::ApcHeaderLimit => "Kitty APC control header exceeds 1024 bytes",
+            Self::ApcPayloadLimit => "Kitty APC Base64 chunk exceeds 4096 bytes",
+            Self::ApcAllocation => "Kitty APC allocation",
         }
     }
 }
@@ -525,10 +591,14 @@ impl OscStringState {
 
 fn osc_payload_limit(selector: u16) -> Option<usize> {
     match selector {
-        0..=2 => Some(MAX_OSC_TITLE_BYTES),
+        0..=2 | 21 => Some(MAX_OSC_TITLE_BYTES),
         4 | 104 => Some(MAX_OSC_PALETTE_BYTES),
+        7 => Some(crate::shell_integration::MAX_CWD_BYTES),
+        133 => Some(4096),
+        9 => Some(128),
+        52 => Some(crate::clipboard::MAX_OSC_BYTES),
         8 => Some(MAX_OSC_PAYLOAD_BYTES),
-        10..=12 | 110..=112 => Some(MAX_OSC_COLOR_BYTES),
+        10..=12 | 17 | 110..=112 | 117 => Some(MAX_OSC_COLOR_BYTES),
         _ => None,
     }
 }
@@ -556,6 +626,9 @@ pub(super) enum IgnoredStringKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ParserState {
     Ground,
+    Vt52Escape,
+    Vt52Row,
+    Vt52Column(u8),
     Escape(EscapeState),
     Csi(HeaderState),
     OscSelector(OscSelectorState),
@@ -566,11 +639,24 @@ pub(super) enum ParserState {
     DcsQuery(DcsSequence),
     DcsIgnore,
     DcsEscape(DcsMode),
+    ApcStart,
+    Apc(ApcSequence),
+    ApcEscape(ApcSequence),
     IgnoredString(IgnoredStringKind),
     IgnoredStringEscape(IgnoredStringKind),
 }
 
 impl ParserState {
+    pub(super) fn is_public_control_payload(&self) -> bool {
+        match self {
+            Self::ApcStart => true,
+            Self::Apc(value) | Self::ApcEscape(value) => value.payload_start.is_none(),
+            Self::DcsQuery(value) | Self::DcsEscape(DcsMode::Query(value)) => {
+                (value.intermediates(), value.final_byte()) == (b"!", b'u')
+            }
+            _ => false,
+        }
+    }
     pub(super) fn is_ground(&self) -> bool {
         matches!(self, Self::Ground)
     }
@@ -585,12 +671,22 @@ impl ParserState {
                 | Self::DcsPassthrough(_)
                 | Self::DcsQuery(_)
                 | Self::DcsIgnore
+                | Self::ApcStart
+                | Self::Apc(_)
                 | Self::IgnoredString(_)
         )
     }
 
     pub(super) fn advance(&mut self, byte: u8) -> Result<Action, ParseError> {
-        if byte == 0x00 || byte == 0x7f {
+        self.advance_with_graphics(byte, false)
+    }
+
+    pub(super) fn advance_with_graphics(
+        &mut self,
+        byte: u8,
+        graphics: bool,
+    ) -> Result<Action, ParseError> {
+        if byte == 0x00 || (byte == 0x7f && !matches!(self, Self::Vt52Row | Self::Vt52Column(_))) {
             return Ok(Action::None);
         }
         if byte == 0x18 || byte == 0x1a {
@@ -639,11 +735,22 @@ impl ParserState {
                     (Self::Escape(EscapeState::new()), Some(sequence))
                 }
                 Self::DcsEscape(DcsMode::Query(sequence)) => {
-                    (Self::Escape(EscapeState::new()), Some(sequence))
+                    let sequence = if (sequence.intermediates(), sequence.final_byte())
+                        == (b"!", b'z')
+                        || sequence.is_graphics()
+                    {
+                        None
+                    } else {
+                        Some(sequence)
+                    };
+                    (Self::Escape(EscapeState::new()), sequence)
                 }
                 Self::DcsEntry(_) => (Self::DcsEscape(DcsMode::Ignore), None),
                 Self::DcsIgnore => (Self::DcsEscape(DcsMode::Ignore), None),
                 Self::DcsEscape(DcsMode::Ignore) => (Self::Escape(EscapeState::new()), None),
+                Self::Apc(sequence) => (Self::ApcEscape(sequence), None),
+                Self::ApcStart => (Self::IgnoredStringEscape(IgnoredStringKind::Apc), None),
+                Self::ApcEscape(_) => (Self::Escape(EscapeState::new()), None),
                 Self::IgnoredString(kind) => (Self::IgnoredStringEscape(kind), None),
                 Self::IgnoredStringEscape(_) => (Self::Escape(EscapeState::new()), None),
                 _ => (Self::Escape(EscapeState::new()), None),
@@ -657,8 +764,9 @@ impl ParserState {
         if byte < 0x20 {
             let state = std::mem::replace(self, Self::Ground);
             match state {
-                Self::OscEscape(escape) => return self.finish_osc_escape(escape, byte),
-                Self::DcsEscape(mode) => return self.finish_dcs_escape(mode, byte),
+                Self::OscEscape(escape) => return self.finish_osc_escape(escape, byte, graphics),
+                Self::DcsEscape(mode) => return self.finish_dcs_escape(mode, byte, graphics),
+                Self::ApcEscape(_) => return self.advance_fresh_escape(byte, graphics),
                 Self::IgnoredStringEscape(kind) => {
                     *self = Self::IgnoredString(kind);
                     return Ok(Action::None);
@@ -675,7 +783,23 @@ impl ParserState {
         let state = std::mem::replace(self, Self::Ground);
         match state {
             Self::Ground => Ok(Action::Print(byte)),
-            Self::Escape(mut escape) => self.advance_escape(&mut escape, byte),
+            Self::Vt52Escape if byte == b'Y' => {
+                *self = Self::Vt52Row;
+                Ok(Action::None)
+            }
+            Self::Vt52Escape => Ok(Action::Vt52 {
+                command: byte,
+                address: None,
+            }),
+            Self::Vt52Row => {
+                *self = Self::Vt52Column(byte);
+                Ok(Action::None)
+            }
+            Self::Vt52Column(row) => Ok(Action::Vt52 {
+                command: b'Y',
+                address: Some((row, byte)),
+            }),
+            Self::Escape(mut escape) => self.advance_escape(&mut escape, byte, graphics),
             Self::Csi(mut header) => self.advance_csi(&mut header, byte),
             Self::OscSelector(mut selector) => match byte {
                 b'0'..=b'9' => {
@@ -694,8 +818,8 @@ impl ParserState {
                 *self = Self::OscString(string);
                 Ok(Action::None)
             }
-            Self::OscEscape(escape) => self.finish_osc_escape(escape, byte),
-            Self::DcsEntry(mut header) => self.advance_dcs_entry(&mut header, byte),
+            Self::OscEscape(escape) => self.finish_osc_escape(escape, byte, graphics),
+            Self::DcsEntry(mut header) => self.advance_dcs_entry(&mut header, byte, graphics),
             Self::DcsPassthrough(sequence) => {
                 *self = Self::DcsPassthrough(sequence);
                 Ok(Action::None)
@@ -709,17 +833,36 @@ impl ParserState {
                 *self = Self::DcsIgnore;
                 Ok(Action::None)
             }
-            Self::DcsEscape(mode) => self.finish_dcs_escape(mode, byte),
+            Self::DcsEscape(mode) => self.finish_dcs_escape(mode, byte, graphics),
+            Self::ApcStart => {
+                if byte == b'G' {
+                    let mut sequence = ApcSequence::default();
+                    sequence.push(byte)?;
+                    *self = Self::Apc(sequence);
+                } else {
+                    *self = Self::IgnoredString(IgnoredStringKind::Apc);
+                }
+                Ok(Action::None)
+            }
+            Self::Apc(mut sequence) => {
+                sequence.push(byte)?;
+                *self = Self::Apc(sequence);
+                Ok(Action::None)
+            }
+            Self::ApcEscape(sequence) if byte == b'\\' => {
+                Ok(Action::Sequence(Sequence::Apc(sequence)))
+            }
+            Self::ApcEscape(_) => self.advance_fresh_escape(byte, graphics),
             Self::IgnoredString(kind) => {
                 *self = Self::IgnoredString(kind);
                 Ok(Action::None)
             }
             Self::IgnoredStringEscape(_) if byte == b'\\' => Ok(Action::None),
-            Self::IgnoredStringEscape(_) => self.advance_fresh_escape(byte),
+            Self::IgnoredStringEscape(_) => self.advance_fresh_escape(byte, graphics),
         }
     }
 
-    fn is_string_state(&self) -> bool {
+    pub(super) fn is_string_state(&self) -> bool {
         matches!(
             self,
             Self::OscSelector(_)
@@ -730,12 +873,20 @@ impl ParserState {
                 | Self::DcsQuery(_)
                 | Self::DcsIgnore
                 | Self::DcsEscape(_)
+                | Self::ApcStart
+                | Self::Apc(_)
+                | Self::ApcEscape(_)
                 | Self::IgnoredString(_)
                 | Self::IgnoredStringEscape(_)
         )
     }
 
-    fn advance_escape(&mut self, escape: &mut EscapeState, byte: u8) -> Result<Action, ParseError> {
+    fn advance_escape(
+        &mut self,
+        escape: &mut EscapeState,
+        byte: u8,
+        graphics: bool,
+    ) -> Result<Action, ParseError> {
         if escape.intermediate_count == 0 {
             match byte {
                 b'\\' => return Ok(Action::None),
@@ -760,7 +911,11 @@ impl ParserState {
                     return Ok(Action::None);
                 }
                 b'_' => {
-                    *self = Self::IgnoredString(IgnoredStringKind::Apc);
+                    *self = if graphics {
+                        Self::ApcStart
+                    } else {
+                        Self::IgnoredString(IgnoredStringKind::Apc)
+                    };
                     return Ok(Action::None);
                 }
                 _ => {}
@@ -799,6 +954,7 @@ impl ParserState {
         &mut self,
         escape: OscEscapeState,
         byte: u8,
+        graphics: bool,
     ) -> Result<Action, ParseError> {
         if byte == b'\\' {
             let sequence = match escape {
@@ -807,13 +963,14 @@ impl ParserState {
             };
             return Ok(Action::Sequence(Sequence::Osc(sequence)));
         }
-        self.advance_fresh_escape(byte)
+        self.advance_fresh_escape(byte, graphics)
     }
 
     fn advance_dcs_entry(
         &mut self,
         header: &mut HeaderState,
         byte: u8,
+        graphics: bool,
     ) -> Result<Action, ParseError> {
         match byte {
             0x30..=0x3f => {
@@ -833,7 +990,7 @@ impl ParserState {
                 if sequence.has_subparameters() {
                     return Err(ParseError::InvalidDcsSyntax);
                 }
-                *self = if sequence.is_query() {
+                *self = if sequence.is_query() || (graphics && sequence.is_graphics()) {
                     Self::DcsQuery(sequence)
                 } else if sequence.requires_dispatch() {
                     Self::DcsPassthrough(sequence)
@@ -846,7 +1003,12 @@ impl ParserState {
         }
     }
 
-    fn finish_dcs_escape(&mut self, mode: DcsMode, byte: u8) -> Result<Action, ParseError> {
+    fn finish_dcs_escape(
+        &mut self,
+        mode: DcsMode,
+        byte: u8,
+        graphics: bool,
+    ) -> Result<Action, ParseError> {
         if byte == b'\\' {
             return Ok(match mode {
                 DcsMode::Passthrough(sequence) | DcsMode::Query(sequence) => {
@@ -855,8 +1017,14 @@ impl ParserState {
                 DcsMode::Ignore => Action::None,
             });
         }
-        let fresh_action = self.advance_fresh_escape(byte);
+        let fresh_action = self.advance_fresh_escape(byte, graphics);
         match mode {
+            DcsMode::Query(sequence)
+                if (sequence.intermediates(), sequence.final_byte()) == (b"!", b'z')
+                    || sequence.is_graphics() =>
+            {
+                fresh_action
+            }
             DcsMode::Passthrough(sequence) | DcsMode::Query(sequence) => {
                 match fresh_action {
                     Ok(_) | Err(_) => {}
@@ -867,13 +1035,13 @@ impl ParserState {
         }
     }
 
-    fn advance_fresh_escape(&mut self, byte: u8) -> Result<Action, ParseError> {
+    fn advance_fresh_escape(&mut self, byte: u8, graphics: bool) -> Result<Action, ParseError> {
         let mut escape = EscapeState::new();
         if byte < 0x20 {
             *self = Self::Escape(escape);
             Ok(Action::Execute(byte))
         } else {
-            self.advance_escape(&mut escape, byte)
+            self.advance_escape(&mut escape, byte, graphics)
         }
     }
 }
@@ -888,7 +1056,180 @@ fn map_csi_to_dcs_error(error: ParseError) -> ParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kitty_apc_is_opt_in_bounded_and_preserves_payload_at_every_split() {
+        let bytes = b"\x1b_Ga=T,s=1,v=1,i=8;AQIDBA==\x1b\\";
+        for split in 0..=bytes.len() {
+            let mut parser = ParserState::Ground;
+            let mut actions = Vec::new();
+            for chunk in [&bytes[..split], &bytes[split..]] {
+                for &byte in chunk {
+                    let action = parser.advance_with_graphics(byte, true).unwrap();
+                    if action != Action::None {
+                        actions.push(action);
+                    }
+                }
+            }
+            let [Action::Sequence(Sequence::Apc(sequence))] = actions.as_slice() else {
+                panic!("unexpected actions at split {split}: {actions:?}");
+            };
+            assert_eq!(sequence.bytes(), &bytes[2..bytes.len() - 2]);
+            let command = crate::kitty_graphics::TransferDecoder::default()
+                .push(sequence.bytes())
+                .unwrap()
+                .unwrap();
+            assert_eq!(command.control.number(b'i'), 8);
+            assert!(parser.is_ground());
+        }
+        let mut legacy = ParserState::Ground;
+        for &byte in bytes {
+            assert_eq!(legacy.advance(byte).unwrap(), Action::None);
+        }
+        assert!(legacy.is_ground());
+        let mut parser = ParserState::Ground;
+        for &byte in b"\x1b_unrelated and unbounded APC\x1b\\" {
+            assert_eq!(
+                parser.advance_with_graphics(byte, true).unwrap(),
+                Action::None
+            );
+        }
+        assert!(parser.is_ground());
+    }
+
+    #[test]
+    fn kitty_apc_cancellation_and_fresh_escape_never_dispatch_partial_images() {
+        for suffix in [&b"\x18"[..], b"\x1a", b"\x1b[0m", b"\x1b\x1b[0m"] {
+            let mut parser = ParserState::Ground;
+            for &byte in b"\x1b_Ga=T;AQID".iter().chain(suffix) {
+                assert!(!matches!(
+                    parser.advance_with_graphics(byte, true).unwrap(),
+                    Action::Sequence(Sequence::Apc(_))
+                ));
+            }
+            assert!(parser.is_ground());
+        }
+        for prefix in [
+            &b"\x1b_Ga=T;cancel"[..],
+            b"\x1b]0;cancel",
+            b"\x1bPq?",
+            b"\x1b_unknown",
+        ] {
+            let mut parser = ParserState::Ground;
+            let mut count = 0;
+            for &byte in prefix.iter().chain(b"\x1b_Ga=q,s=1,v=1;AQIDBA==\x1b\\") {
+                if let Action::Sequence(Sequence::Apc(sequence)) =
+                    parser.advance_with_graphics(byte, true).unwrap()
+                {
+                    assert_eq!(sequence.bytes(), b"Ga=q,s=1,v=1;AQIDBA==");
+                    count += 1;
+                }
+            }
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn kitty_apc_header_diagnostics_stay_public_but_pixels_are_private_and_limited() {
+        let mut parser = ParserState::Ground;
+        for &byte in b"\x1b_" {
+            parser.advance_with_graphics(byte, true).unwrap();
+        }
+        for &byte in b"Ga=T,s=1,v=1;" {
+            assert!(parser.is_public_control_payload());
+            parser.advance_with_graphics(byte, true).unwrap();
+        }
+        for _ in 0..crate::kitty_graphics::MAX_CHUNK_BYTES {
+            assert!(!parser.is_public_control_payload());
+            parser.advance_with_graphics(b'A', true).unwrap();
+        }
+        assert_eq!(
+            parser.advance_with_graphics(b'A', true),
+            Err(ParseError::ApcPayloadLimit)
+        );
+        let mut parser = ParserState::Ground;
+        for &byte in b"\x1b_G" {
+            parser.advance_with_graphics(byte, true).unwrap();
+        }
+        for _ in 1..crate::kitty_graphics::MAX_CONTROL_BYTES {
+            parser.advance_with_graphics(b'x', true).unwrap();
+        }
+        let mut valid = parser.clone();
+        valid.advance_with_graphics(b';', true).unwrap();
+        assert!(!valid.is_public_control_payload());
+        assert_eq!(
+            parser.advance_with_graphics(b'x', true),
+            Err(ParseError::ApcHeaderLimit)
+        );
+    }
     use crate::{Event, Terminal, TerminalError};
+
+    #[test]
+    fn staged_graphics_parser_retains_payload_only_when_opted_in_and_at_every_split() {
+        for (stream, expected) in [
+            (
+                b"\x1bP7;1q#1;2;100;0;0!3~\x1b\\".as_slice(),
+                b"#1;2;100;0;0!3~".as_slice(),
+            ),
+            (
+                b"\x1bP1;1;0;5;1;2;8;0{ @@/B\x1b\\".as_slice(),
+                b" @@/B".as_slice(),
+            ),
+        ] {
+            for split in 0..=stream.len() {
+                let mut parser = ParserState::Ground;
+                let mut captured = Vec::new();
+                for part in [&stream[..split], &stream[split..]] {
+                    for &byte in part {
+                        if let Action::Sequence(Sequence::Dcs(sequence)) =
+                            parser.advance_with_graphics(byte, true).unwrap()
+                        {
+                            captured.push(sequence);
+                        }
+                    }
+                }
+                assert_eq!(captured.len(), 1);
+                assert_eq!(captured[0].payload(), expected);
+                assert!(parser.is_ground());
+            }
+            let mut parser = ParserState::Ground;
+            let legacy = feed(&mut parser, stream).unwrap();
+            let [Action::Sequence(Sequence::Dcs(value))] = legacy.as_slice() else {
+                panic!("legacy stateful dispatch")
+            };
+            assert!(value.payload().is_empty());
+        }
+    }
+
+    #[test]
+    fn incomplete_graphics_are_cancelled_not_dispatched_and_drcs_storage_is_bounded() {
+        for suffix in [
+            b"\x18".as_slice(),
+            b"\x1a",
+            b"\x1b\x18",
+            b"\x1b\x1b",
+            b"\x1b[31m",
+        ] {
+            let mut parser = ParserState::Ground;
+            for &byte in b"\x1bPq#1;2;100;0;0~".iter().chain(suffix) {
+                assert!(!matches!(
+                    parser.advance_with_graphics(byte, true).unwrap(),
+                    Action::Sequence(Sequence::Dcs(_))
+                ));
+            }
+        }
+        let mut parser = ParserState::Ground;
+        for &byte in b"\x1bP{" {
+            parser.advance_with_graphics(byte, true).unwrap();
+        }
+        for _ in 0..crate::drcs::MAX_DRCS_PAYLOAD_BYTES {
+            parser.advance_with_graphics(b'?', true).unwrap();
+        }
+        assert_eq!(
+            parser.advance_with_graphics(b'?', true),
+            Err(ParseError::DcsQueryPayloadLimit)
+        );
+    }
 
     fn feed(parser: &mut ParserState, bytes: &[u8]) -> Result<Vec<Action>, ParseError> {
         bytes.iter().try_fold(Vec::new(), |mut actions, &byte| {
@@ -1532,7 +1873,7 @@ mod tests {
             (&b"\x1bP1;2|data\x1b\\"[..], &b""[..], b'|'),
             (&b"\x1bP0;0{data\x1b\\"[..], &b""[..], b'{'),
             (&b"\x1bP1;0!zdata\x1b\\"[..], &b"!"[..], b'z'),
-            (&b"\x1bP1!udata\x1b\\"[..], &b"!"[..], b'u'),
+            (&b"\x1bP1!uBAD\x1b\\"[..], &b"!"[..], b'u'),
             (&b"\x1bP1$pdata\x1b\\"[..], &b"$"[..], b'p'),
             (&b"\x1bP1$tdata\x1b\\"[..], &b"$"[..], b't'),
         ] {
@@ -1543,8 +1884,21 @@ mod tests {
             };
             assert_eq!(sequence.intermediates(), expected_intermediates);
             assert_eq!(sequence.final_byte(), expected_final);
-            assert!(sequence.payload().is_empty());
-            assert_eq!(sequence.payload.capacity(), 0);
+            if expected_intermediates == b"$"
+                || (expected_intermediates == b"!" && matches!(expected_final, b'u' | b'z'))
+            {
+                assert_eq!(
+                    sequence.payload(),
+                    if expected_intermediates == b"!" && expected_final == b'u' {
+                        b"BAD".as_slice()
+                    } else {
+                        b"data".as_slice()
+                    }
+                );
+            } else {
+                assert!(sequence.payload().is_empty());
+                assert_eq!(sequence.payload.capacity(), 0);
+            }
             assert!(parser.is_ground());
         }
     }
@@ -1552,8 +1906,8 @@ mod tests {
     #[test]
     fn newly_classified_stateful_dcs_families_fail_closed_explicitly() {
         for (bytes, feature) in [
-            (&b"\x1bP1!udata\x1b\\"[..], "DECAUPSS"),
-            (&b"\x1bP1$pdata\x1b\\"[..], "DECRSTS"),
+            (&b"\x1bP1!uBAD\x1b\\"[..], "DECAUPSS charset designation"),
+            (&b"\x1bP1$pdata\x1b\\"[..], "DEC state restore selector"),
         ] {
             let mut terminal = Terminal::new(8, 2).expect("terminal");
             assert_eq!(

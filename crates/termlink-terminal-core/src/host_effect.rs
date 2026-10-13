@@ -14,9 +14,14 @@ const HEADER_SIZE: usize = 64;
 const RECORD_SIZE: usize = 40;
 const REQUIRED_FEATURES: u64 = 1;
 const EFFECT_KIND_PTY_REPLY: u32 = 1;
+const EFFECT_KIND_RESIZE_REQUEST: u32 = 2;
+const RESIZE_REQUEST_FEATURE: u64 = 2;
+const EFFECT_KIND_PLATFORM_ACTION: u32 = 3;
+const PLATFORM_ACTION_FEATURE: u64 = 4;
 
 #[derive(Clone, Copy, Debug)]
 struct Record {
+    kind: u32,
     source_sequence: u64,
     source_offset_end: u32,
     ordinal: u32,
@@ -25,6 +30,25 @@ struct Record {
 }
 
 pub(crate) trait CaptureSink {
+    fn push_platform_action(
+        &mut self,
+        _sequence: u64,
+        _offset: u32,
+        _payload: &[u8],
+    ) -> Result<(), TerminalError> {
+        Err(TerminalError::HostEffectVersionRequired)
+    }
+
+    fn push_resize(
+        &mut self,
+        _source_sequence: u64,
+        _source_offset_end: u32,
+        _columns: u16,
+        _rows: u16,
+    ) -> Result<(), TerminalError> {
+        Err(TerminalError::HostEffectVersionRequired)
+    }
+
     fn push_reply(
         &mut self,
         source_sequence: u64,
@@ -72,6 +96,7 @@ impl Capture {
         self.payload.extend_from_slice(payload);
         debug_assert_eq!(self.payload.len(), new_payload_len);
         self.records.push(Record {
+            kind: EFFECT_KIND_PTY_REPLY,
             source_sequence,
             source_offset_end,
             ordinal: 0,
@@ -178,11 +203,30 @@ pub(crate) struct CaptureV2 {
     payload: Vec<u8>,
     last_key: Option<(u64, u32)>,
     last_ordinal: u32,
+    resize_requests: u32,
+    last_bell_sequence: Option<u64>,
+    sound_requests: u32,
+    clipboard_requests: u32,
 }
 
 impl CaptureV2 {
     pub(crate) fn push(
         &mut self,
+        source_sequence: u64,
+        source_offset_end: u32,
+        payload: &[u8],
+    ) -> Result<(), TerminalError> {
+        self.push_kind(
+            EFFECT_KIND_PTY_REPLY,
+            source_sequence,
+            source_offset_end,
+            payload,
+        )
+    }
+
+    fn push_kind(
+        &mut self,
+        kind: u32,
         source_sequence: u64,
         source_offset_end: u32,
         payload: &[u8],
@@ -203,7 +247,7 @@ impl CaptureV2 {
                 .ok_or(TerminalError::LimitExceeded)?,
             Some(_) => return Err(TerminalError::Unsupported("host effect ordering")),
         };
-        if !is_canonical_reply_v2(payload) {
+        if kind == EFFECT_KIND_PTY_REPLY && !is_canonical_reply_v2(payload) {
             return Err(TerminalError::Unsupported("host effect reply grammar"));
         }
 
@@ -223,6 +267,7 @@ impl CaptureV2 {
         self.payload.extend_from_slice(payload);
         debug_assert_eq!(self.payload.len(), new_payload_len);
         self.records.push(Record {
+            kind,
             source_sequence,
             source_offset_end,
             ordinal,
@@ -281,12 +326,32 @@ impl CaptureV2 {
             32,
             u64::try_from(payload_offset).map_err(|_| TerminalError::LimitExceeded)?,
         );
-        put_u64(&mut frame, 40, REQUIRED_FEATURES);
+        let required_features = REQUIRED_FEATURES
+            | if self
+                .records
+                .iter()
+                .any(|r| r.kind == EFFECT_KIND_RESIZE_REQUEST)
+            {
+                RESIZE_REQUEST_FEATURE
+            } else {
+                0
+            };
+        let required_features = required_features
+            | if self
+                .records
+                .iter()
+                .any(|r| r.kind == EFFECT_KIND_PLATFORM_ACTION)
+            {
+                PLATFORM_ACTION_FEATURE
+            } else {
+                0
+            };
+        put_u64(&mut frame, 40, required_features);
 
         for record in self.records {
             let base = frame.len();
             frame.resize(base + RECORD_SIZE, 0);
-            put_u32(&mut frame, base, EFFECT_KIND_PTY_REPLY);
+            put_u32(&mut frame, base, record.kind);
             put_u64(&mut frame, base + 8, record.source_sequence);
             put_u32(&mut frame, base + 16, record.source_offset_end);
             put_u32(&mut frame, base + 20, record.ordinal);
@@ -315,6 +380,60 @@ impl CaptureV2 {
 }
 
 impl CaptureSink for CaptureV2 {
+    fn push_platform_action(
+        &mut self,
+        sequence: u64,
+        offset: u32,
+        payload: &[u8],
+    ) -> Result<(), TerminalError> {
+        // Bells are advisory: collapse a burst within one source event before allocating records.
+        if payload[0] == 1 && self.last_bell_sequence == Some(sequence) {
+            return Ok(());
+        }
+        if payload[0] == 2 && self.sound_requests >= 64 {
+            return Err(TerminalError::LimitExceeded);
+        }
+        if payload[0] == 3 && self.clipboard_requests >= 4 {
+            return Err(TerminalError::ProtocolResourceLimit(
+                "OSC 52 exceeds 4 clipboard requests per capture",
+            ));
+        }
+        self.push_kind(EFFECT_KIND_PLATFORM_ACTION, sequence, offset, payload)?;
+        if payload[0] == 1 {
+            self.last_bell_sequence = Some(sequence);
+        }
+        if payload[0] == 2 {
+            self.sound_requests += 1;
+        }
+        if payload[0] == 3 {
+            self.clipboard_requests += 1;
+        }
+        Ok(())
+    }
+
+    fn push_resize(
+        &mut self,
+        source_sequence: u64,
+        source_offset_end: u32,
+        columns: u16,
+        rows: u16,
+    ) -> Result<(), TerminalError> {
+        if self.resize_requests >= 64 {
+            return Err(TerminalError::LimitExceeded);
+        }
+        let mut payload = [0_u8; 8];
+        payload[..4].copy_from_slice(&u32::from(columns).to_le_bytes());
+        payload[4..].copy_from_slice(&u32::from(rows).to_le_bytes());
+        self.push_kind(
+            EFFECT_KIND_RESIZE_REQUEST,
+            source_sequence,
+            source_offset_end,
+            &payload,
+        )?;
+        self.resize_requests += 1;
+        Ok(())
+    }
+
     fn push_reply(
         &mut self,
         source_sequence: u64,
@@ -347,6 +466,15 @@ fn is_canonical_reply(payload: &[u8]) -> bool {
 }
 
 fn is_canonical_reply_v2(payload: &[u8]) -> bool {
+    if let Some(normalized) = crate::traditional::decode_c1_reply(payload) {
+        return is_canonical_reply_v2(&normalized);
+    }
+    if payload == b"\x1b/Z" {
+        return true;
+    }
+    if crate::traditional::canonical_upss_report(payload) {
+        return true;
+    }
     is_canonical_reply(payload)
         || is_canonical_keyboard_reply(payload)
         || is_canonical_decrpm(payload)
@@ -354,6 +482,11 @@ fn is_canonical_reply_v2(payload: &[u8]) -> bool {
         || is_canonical_xtversion(payload)
         || is_canonical_xtgettcap(payload)
         || is_canonical_osc_color(payload)
+        || crate::host_geometry::canonical_geometry_reply(payload)
+        || crate::host_theme::is_theme_reply(payload)
+        || crate::extended_queries::canonical_extended_reply(payload)
+        || crate::state_reports::canonical_report(payload)
+        || crate::kitty_graphics::canonical_response(payload)
 }
 
 fn is_canonical_xtversion(payload: &[u8]) -> bool {
@@ -395,11 +528,29 @@ fn is_canonical_decrqss(payload: &[u8]) -> bool {
     let Some(status) = body.strip_prefix(b"1$r") else {
         return false;
     };
-    is_canonical_sgr_status(status)
+    is_canonical_color_assignment(status)
+        || is_canonical_sgr_status(status)
         || is_canonical_margin_status(status, b'r')
         || is_canonical_margin_status(status, b's')
         || matches!(status, b"1 q" | b"2 q" | b"3 q" | b"4 q" | b"5 q" | b"6 q")
         || matches!(status, b"1\"q" | b"2\"q" | b"1*x" | b"2*x")
+}
+
+fn is_canonical_color_assignment(status: &[u8]) -> bool {
+    let Some(body) = status.strip_suffix(b",|") else {
+        return false;
+    };
+    let mut fields = body.split(|&byte| byte == b';');
+    matches!(fields.next(), Some(b"1" | b"2"))
+        && fields
+            .next()
+            .and_then(canonical_u32)
+            .is_some_and(|index| index <= 257)
+        && fields
+            .next()
+            .and_then(canonical_u32)
+            .is_some_and(|index| index <= 257)
+        && fields.next().is_none()
 }
 
 fn is_canonical_sgr_status(status: &[u8]) -> bool {
@@ -511,8 +662,8 @@ fn is_canonical_osc_color(payload: &[u8]) -> bool {
         (Some(b"4"), Some(index), Some(color), None) => {
             canonical_u32(index).is_some_and(|value| value <= 255) && is_canonical_rgb_color(color)
         }
-        (Some(selector @ (b"10" | b"11" | b"12")), Some(color), None, None) => {
-            debug_assert!(matches!(selector, b"10" | b"11" | b"12"));
+        (Some(selector @ (b"10" | b"11" | b"12" | b"17")), Some(color), None, None) => {
+            debug_assert!(matches!(selector, b"10" | b"11" | b"12" | b"17"));
             is_canonical_rgb_color(color)
         }
         _ => false,
@@ -789,6 +940,9 @@ mod tests {
             &b"\x1b[?1;2c"[..],
             b"\x1b[?31u",
             b"\x1b[512;512R",
+            b"\x1b[8;1;512t",
+            b"\x1b[8;512;1t",
+            b"\x1b[6;20;10t",
             b"\x1b[4;2$y",
             b"\x1b[?25;1$y",
             b"\x1bP0$r\x1b\\",
@@ -813,6 +967,11 @@ mod tests {
 
         for reply in [
             &b"\x1b[31m"[..],
+            b"\x1b[8;0;1t",
+            b"\x1b[8;1;513t",
+            b"\x1b[8;01;1t",
+            b"\x1b[8;1;1;1t",
+            b"\x1b[6;1025;10t",
             b"\x1b[?025;1$y",
             b"\x1b[?25;5$y",
             b"\x1bP1$rarbitrary\x1b\\",

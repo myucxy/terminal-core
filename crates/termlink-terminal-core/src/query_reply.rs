@@ -268,6 +268,7 @@ pub(crate) fn build_osc_default_color_reply(
         DefaultColorSlot::Foreground => 10,
         DefaultColorSlot::Background => 11,
         DefaultColorSlot::Cursor => 12,
+        DefaultColorSlot::SelectionBackground => 17,
     };
     let mut writer = ReplyWriter::with_capacity(40)?;
     writer.bytes(b"\x1b]")?;

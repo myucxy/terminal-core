@@ -1,6 +1,6 @@
 # Terminal Core 通用 CLI/TUI 开发路线图
 
-更新日期：2026-08-30
+更新日期：2026-10-09
 目标：将 `terminal-core` 建设为可供 TermLink Windows、Android 及后续平台共同使用的通用终端状态核心，稳定兼容主流 CLI/TUI 应用。
 
 ## 1. 文档定位
@@ -8,6 +8,11 @@
 本文是后续开发的主入口，用来记录优先级、依赖、完成标准和接续位置。协议级缺口的详细设计继续记录在
 [`UNIMPLEMENTED_CAPABILITIES.md`](UNIMPLEMENTED_CAPABILITIES.md)，已实现 ABI、事件和 Snapshot 契约以
 [`README.md`](README.md) 及公共头文件为准。
+
+2026-10-09 全量实施范围已由用户明确：上一轮 22 组未实现/部分实现能力全部纳入。
+最新依赖、S0–S8 阶段、逐项验收和测试/复核流程以
+[`FULL_CAPABILITY_IMPLEMENTATION_PLAN_20261009.md`](FULL_CAPABILITY_IMPLEMENTATION_PLAN_20261009.md) 为准；
+本文件较早的“按需选择”不能据此缩减本次范围，低优先级只表示较晚实施。
 
 维护规则：
 
@@ -49,7 +54,7 @@
 
 注意：TL-H115 的产品方案不等于 core 已具备公共 History Page API；独立复用 core 时，内部 runtime scrollback 仍然有界。
 
-### 当前工作区中的开发批次
+### 历史开发批次（保留当时状态，不能视为当前未实现清单）
 
 - `[~]` Snapshot V2.9。
 - `[~]` XTVERSION canonical reply。
@@ -57,7 +62,9 @@
 - `[~]` private modes `2027`、`2031`。
 - `[~]` OSC `default` reset。
 
-这些改动目前位于 `host_effect.rs`、`lib.rs`、`modes.rs`、`osc.rs`、`snapshot.rs`、`tests.rs`。在完成审查和完整测试前，不得写成已发布能力。
+这些条目对应早期 `host_effect.rs`、`lib.rs`、`modes.rs`、`osc.rs`、`snapshot.rs`、`tests.rs` 的开发记录。
+2026-10-09 核对时已有对应实现，Snapshot 也已推进到 V2.10；这不等于原清单的全部跨端验收已完成。
+其中 2027/2031 的模式状态与完整语义须分开检查，详见本次能力对照 C03/E04。
 
 ### 2026-09-01 OpenCode resize/reflow 稳定性批次
 
@@ -76,9 +83,47 @@
 
 ## 4. 当前接续点
 
-下次打开仓库时，从工作项 `W0` 开始：
+最新 DEV 已完成 C03 Unicode/profile 2 的核心、V4 双端绑定与 Android 绘制，以及 C04 行属性
+核心和 Android 绘制。旧默认 width profile 1 与 V1–V3 字节契约保留。当前 Snapshot 可达 2.13；
+32 项模拟器 JNI/View 测试通过，仍未替换主客户端。具体状态与后续产品边界见
+[Unicode 实施记录](S1_S4_REPORTS_UNICODE_BASELINE_20261009.md)和
+[C04 行属性记录](S2_LINE_RENDITIONS_20261009.md)。
 
-### W0：收口当前开发批次
+2026-10-09 S1 首批进展：已实现安全协议诊断导出、双端本地详情及 C05 剩余三项编辑指令，
+通过 Rust、Windows 绑定/ConPTY、Android 单元及模拟器 JNI 验证。
+详见 [实现和验收记录](S1_DIAGNOSTICS_EDITING_20261009.md)；S1 及全量 22 组均未关闭。
+下一步为 C02 精细定位/来源/实际影响、C01 可信几何、C07 查询与正式产品 Relay 联测。
+
+2026-10-09 接续优先级调整：先处理 **Q0：查询兼容导致会话退出**，再整理历史 W0 清单。
+8 月清单中的未勾选项不全是当前缺失能力，不能直接统计成未实现数量；本次代码核对见
+[`WINDOWS_TERMINAL_CAPABILITY_REVIEW_20261009.md`](WINDOWS_TERMINAL_CAPABILITY_REVIEW_20261009.md)。
+
+### Q0：尺寸查询和可选指令的错误边界（首批 DEV 已验证，待产品升级）
+
+- `[!]` `CSI 16 t` 已确认使 HOME-PC Claude 启动失败：native Unsupported → Windows exit 125 / Android TL-H122。
+- `[x]` 补充 `14/14;2/15/16/18/19 t` 查询矩阵，18t 准确回复，像素/屏幕查询无回复回退。
+- `[~]` 已知只读几何探测与必要状态/损坏数据分开处理；其他查询族仍需逐项审核。
+- `[x]` 同步应用的外层终端自动回复识别/去重，18t 按 source coordinate 合并期待。
+- `[x]` 分块、故障真实 WAL 36/36 回放、Android 模拟器 JNI checkpoint 回放和 Windows 隔离真实 Claude 生命周期通过。
+- `[x]` 匹配 DLL/四 ABI SO 已导出为 DEV，五库哈希核验通过。
+- `[ ]` 更新双端主客户端后的真实 Relay 产品联测及正式发布门禁。
+
+详细待办和已有证据见 [`UNIMPLEMENTED_CAPABILITIES.md`](UNIMPLEMENTED_CAPABILITIES.md)。
+代码覆盖范围、526 项 Rust/golden/FFI、147 项 Android 单元及 22 项模拟器验证和日志见
+[`QUERY_COMPATIBILITY_FIX_20261009.md`](QUERY_COMPATIBILITY_FIX_20261009.md)。尚未替换安装中的主客户端或发布。
+
+### Q1：Windows Terminal 能力对照接续
+
+- `[~]` C03/C05/E04：DECSTR 及准确能力声明已实现；完整字素、主题报告和其余补充编辑待继续。
+- `[ ]` 推进 H01–H04：shell 目录与命令标记、通知/进度、OSC 52、alternate-scroll 模式协商。
+- `[ ]` 其余 C04/C06–C14 全部纳入 S2/S4/S6；图形及旧终端扩展不阻塞 P0 独立修复，但不再从全量目标中省略。
+- `[ ]` History Page/Delta 继续按独立 API 路线验收，不计作 Windows Terminal 同类缺口。
+- `[ ]` G01 Kitty graphics、Windows 完整展示路径与跨平台资源链按全量计划验收；只补 parser 不算产品完成。
+
+上述 ID、18 组差距的统计范围和逐项完成标准见
+[`WINDOWS_TERMINAL_CAPABILITY_REVIEW_20261009.md`](WINDOWS_TERMINAL_CAPABILITY_REVIEW_20261009.md)。
+
+### W0：收口历史开发批次（以下为旧待办，逐项核对后更新）
 
 - `[ ]` 复核上述六个已修改 Rust 文件的 diff，确认没有覆盖交叉工作。
 - `[ ]` 检查 Snapshot V2.9 的 canonical bytes、feature bits、旧版本 byte stability 和损坏输入拒绝。

@@ -1,21 +1,92 @@
-//! Dependency-free, deterministic TermLink terminal state engine.
+//! Deterministic TermLink terminal state engine.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 mod charset;
 mod crc32c;
+mod delta;
+mod delta_journal;
+#[cfg(test)]
+mod delta_tests;
+mod diagnostic;
+pub use delta::{
+    DeltaApply, DeltaCheckpoint, DeltaContext, DeltaError, DeltaStateInfo, MAX_STATE_DELTA_BYTES,
+    STATE_DELTA_PROFILE_STANDALONE_C1_V1, STATE_DELTA_PROFILE_UNICODE16_STANDALONE_C1_V1,
+    STATE_DELTA_PROFILE_UNICODE16_V1, STATE_DELTA_PROFILE_V1, apply_delta_v1, export_delta_v1,
+};
+pub use delta_journal::{DeltaJournal, DeltaJournalConfig, DeltaJournalInfo};
+pub mod drcs;
+pub mod drcs_bank;
+mod extended_queries;
+pub mod graphics_layout;
+pub mod graphics_png;
+pub mod graphics_resources;
+pub mod graphics_state;
+pub mod graphics_zlib;
+mod history_frame;
+mod history_page;
 mod host_effect;
+mod host_geometry;
+#[cfg(test)]
+mod host_geometry_tests;
+mod host_signals;
+mod host_theme;
+mod shell_integration;
+pub mod sixel;
+pub use host_signals::{HOST_SIGNALS_V1_BYTES, HostSignalsV1};
+mod base64;
+mod clipboard;
+pub mod kitty_graphics;
+mod legacy_projection;
+pub use legacy_projection::MAX_LEGACY_PROJECTION_BYTES;
+pub use shell_integration::{MAX_SHELL_STATE_BYTES, ShellCommand, ShellIntegration, ShellPoint};
+#[cfg(test)]
+mod host_theme_tests;
 mod input;
+mod legacy_charset_data;
+mod legacy_charsets;
+mod line_rendition;
+#[cfg(test)]
+mod macro_tests;
+mod macros;
 mod modes;
 mod osc;
+#[cfg(test)]
+mod page_tests;
+mod pages;
 mod parser;
 mod query_reply;
 mod render_frame;
+pub mod render_frame_v5;
 mod screen;
+mod sgr_stack;
 mod snapshot;
+mod state_reports;
 mod tabs;
+mod terminal_drcs;
+#[cfg(test)]
+mod terminal_drcs_tests;
+mod terminal_graphics;
+#[cfg(test)]
+mod terminal_graphics_edit_tests;
+mod terminal_graphics_motion;
+mod terminal_sixel;
+mod traditional;
+mod unicode16;
 mod unicode_width;
+mod width_profile;
+pub use history_page::{
+    HISTORY_LATEST_ANCHOR, HistoryCapture, HistoryLine, HistoryPage, HistoryPageError,
+    HistoryPageRequest, MAX_HISTORY_CAPTURE_BYTES, MAX_HISTORY_GRAPHICS_CAPTURE_BYTES,
+    MAX_HISTORY_PAGE_BYTES, MAX_HISTORY_PAGE_CELLS, MAX_HISTORY_PAGE_LINES, MAX_HISTORY_PAGE_UTF8,
+    MAX_HISTORY_PAGE_V2_BYTES,
+};
+pub use host_geometry::{HOST_GEOMETRY_V1_BYTES, HostGeometryV1};
+pub use host_theme::{HOST_THEME_V1_BYTES, HostThemeV1};
+pub use line_rendition::LineRendition;
+pub use width_profile::WidthProfile;
 
 use charset::{CharsetSize, CharsetState, GraphicRegister, RectangleFillError};
 pub use host_effect::{
@@ -42,20 +113,26 @@ use parser::{
 };
 pub use render_frame::{
     MAX_RENDER_FRAME_V1_BYTES, MAX_RENDER_FRAME_V2_BYTES, MAX_RENDER_FRAME_V3_BYTES,
-    RENDER_FRAME_V1_FORMAT_VERSION, RENDER_FRAME_V2_FORMAT_VERSION, RENDER_FRAME_V3_FORMAT_VERSION,
+    MAX_RENDER_FRAME_V4_BYTES, RENDER_FRAME_V1_FORMAT_VERSION, RENDER_FRAME_V2_FORMAT_VERSION,
+    RENDER_FRAME_V3_FORMAT_VERSION, RENDER_FRAME_V4_FORMAT_VERSION,
 };
 use screen::{Screen, ScrollCause};
 use tabs::TabStops;
-use unicode_width::{grapheme_width, scalar_width};
+use terminal_graphics_motion::GraphicMotion;
+use unicode_width::scalar_width;
 
 pub const MAX_COLUMNS: u32 = 512;
 pub const MAX_ROWS: u32 = 512;
 pub const MAX_CELLS: usize = 262_144;
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_BROKER_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+/// Additive graphics profile; legacy C/JNI APIs keep their original 64 MiB admission limit.
+pub const MAX_GRAPHICS_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_GRAPHEME_BYTES: usize = 14;
 pub const MAX_CAPTURE_EVENT_COUNT: usize = 256;
 pub const MAX_CAPTURE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+pub use diagnostic::MAX_DIAGNOSTIC_V1_BYTES;
 
 /// Selects how output bytes in the C1 range are interpreted.
 ///
@@ -149,6 +226,8 @@ pub struct Cell {
     pub attributes: Attributes,
     pub protected: bool,
     pub hyperlink: Option<HyperlinkRef>,
+    /// Immutable downloaded glyph; never encoded as a Unicode private-use character.
+    pub glyph: Option<drcs_bank::GlyphReference>,
 }
 
 impl Cell {
@@ -161,6 +240,7 @@ impl Cell {
             attributes,
             protected: false,
             hyperlink: None,
+            glyph: None,
         }
     }
 
@@ -183,6 +263,7 @@ impl Cell {
             attributes,
             protected,
             hyperlink,
+            glyph: None,
         }
     }
 
@@ -199,6 +280,7 @@ impl Cell {
             attributes,
             protected,
             hyperlink,
+            glyph: None,
         }
     }
 
@@ -284,6 +366,7 @@ struct RepeatSource {
     character: char,
     combining: String,
     width: u8,
+    glyph: Option<drcs_bank::GlyphReference>,
 }
 
 impl RepeatSource {
@@ -292,12 +375,13 @@ impl RepeatSource {
             character,
             combining: String::new(),
             width: scalar_width(character),
+            glyph: None,
         }
     }
 
-    fn append(&mut self, character: char) -> Result<(), TerminalError> {
+    fn append(&mut self, character: char, profile: WidthProfile) -> Result<(), TerminalError> {
         if self.character.len_utf8() + self.combining.len() + character.len_utf8()
-            > MAX_GRAPHEME_BYTES
+            > profile.max_grapheme_bytes()
         {
             return Err(TerminalError::Unsupported("grapheme size limit"));
         }
@@ -305,7 +389,7 @@ impl RepeatSource {
             .try_reserve_exact(character.len_utf8())
             .map_err(|_| TerminalError::LimitExceeded)?;
         self.combining.push(character);
-        self.width = grapheme_width(self.character, &self.combining);
+        self.width = profile.grapheme_width(self.character, &self.combining);
         Ok(())
     }
 }
@@ -316,6 +400,14 @@ pub struct Terminal {
     rows: u32,
     main: Screen,
     alternate: Screen,
+    pages: pages::PageStore,
+    host_geometry: HostGeometryV1,
+    shell_integration: ShellIntegration,
+    host_signals: HostSignalsV1,
+    graphics: Option<graphics_state::GraphicsState>,
+    kitty_transfer: kitty_graphics::TransferDecoder,
+    broker_replay: Option<BrokerReplay>,
+    legacy_projection: Option<legacy_projection::Projection>,
     active_alternate: bool,
     cursor_visible: bool,
     cursor_shape: CursorShape,
@@ -326,6 +418,7 @@ pub struct Terminal {
     margins: Margins,
     tabs: TabStops,
     charset: CharsetState,
+    user_preferred_charset: charset::CharsetDesignation,
     main_saved_charset: CharsetState,
     alternate_saved_charset: CharsetState,
     osc: OscState,
@@ -337,11 +430,23 @@ pub struct Terminal {
     utf8: Utf8Decoder,
     string_utf8: StringUtf8Boundary,
     repeat_source: Option<RepeatSource>,
+    sgr_stack: sgr_stack::SgrStack,
+    macros: macros::MacroStore,
+    macro_execution: macros::MacroExecution,
     failed_closed: bool,
+    diagnostics: diagnostic::OutputDiagnostics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event<'a> {
+    HostTheme {
+        source_sequence: u64,
+        bytes: &'a [u8],
+    },
+    HostGeometry {
+        source_sequence: u64,
+        geometry: HostGeometryV1,
+    },
     Output {
         source_sequence: u64,
         bytes: &'a [u8],
@@ -360,10 +465,20 @@ pub enum Event<'a> {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BrokerReplay {
+    captures: Vec<Arc<kitty_graphics::BrokerCapture>>,
+    next_ordinal: u16,
+    pending: Option<kitty_graphics::BrokerRequest>,
+}
+
 impl Event<'_> {
     fn source_sequence(self) -> u64 {
         match self {
-            Self::Output {
+            Self::HostTheme {
+                source_sequence, ..
+            }
+            | Self::Output {
                 source_sequence, ..
             }
             | Self::Resize {
@@ -373,11 +488,15 @@ impl Event<'_> {
                 source_sequence, ..
             }
             | Self::Gap { source_sequence } => source_sequence,
+            Self::HostGeometry {
+                source_sequence, ..
+            } => source_sequence,
         }
     }
 }
 
 struct EffectContext<'a> {
+    send_c1: bool,
     capture: &'a mut dyn host_effect::CaptureSink,
     source_sequence: u64,
     source_offset_end: u32,
@@ -386,6 +505,7 @@ struct EffectContext<'a> {
 impl EffectContext<'_> {
     fn reborrow(&mut self) -> EffectContext<'_> {
         EffectContext {
+            send_c1: self.send_c1,
             capture: &mut *self.capture,
             source_sequence: self.source_sequence,
             source_offset_end: self.source_offset_end,
@@ -397,11 +517,28 @@ impl EffectContext<'_> {
 pub enum TerminalError {
     InvalidDimensions,
     LimitExceeded,
-    SequenceMismatch { expected: u64, actual: u64 },
+    ProtocolResourceLimit(&'static str),
+    SequenceMismatch {
+        expected: u64,
+        actual: u64,
+    },
     SequenceExhausted,
     FailedClosed,
     HostEffectVersionRequired,
+    BrokerCaptureRequired,
+    RenderFrameVersionRequired,
     Unsupported(&'static str),
+    UnsupportedPayload {
+        reason: &'static str,
+        offset: usize,
+        byte: Option<u8>,
+    },
+    UnsupportedDecodedPayload {
+        domain: &'static str,
+        reason: &'static str,
+        offset: usize,
+        byte: u8,
+    },
     Gap,
     SnapshotNotEligible,
     PresentationDeferred,
@@ -415,6 +552,18 @@ impl Display for TerminalError {
         match self {
             Self::InvalidDimensions => formatter.write_str("invalid terminal dimensions"),
             Self::LimitExceeded => formatter.write_str("terminal limit exceeded"),
+            Self::ProtocolResourceLimit(reason) => formatter.write_str(reason),
+            Self::UnsupportedPayload { reason, offset, byte } => {
+                write!(formatter, "{reason}; retained payload byte {offset}: ")?;
+                match byte {
+                    Some(byte @ 0x20..=0x7e) => write!(formatter, "0x{byte:02X} U+{byte:04X} '{}'", char::from(*byte)),
+                    Some(byte) => write!(formatter, "0x{byte:02X}"),
+                    None => formatter.write_str("end of payload"),
+                }
+            }
+            Self::UnsupportedDecodedPayload { domain, reason, offset, byte } => {
+                write!(formatter, "{reason}; decoded {domain} byte {offset}: 0x{byte:02X} (not an original stream offset)")
+            }
             Self::SequenceMismatch { expected, actual } => {
                 write!(
                     formatter,
@@ -426,6 +575,9 @@ impl Display for TerminalError {
             Self::HostEffectVersionRequired => {
                 formatter.write_str("host effect frame V2 is required for this terminal reply")
             }
+            Self::BrokerCaptureRequired => formatter.write_str("Kitty broker capture is required"),
+            Self::RenderFrameVersionRequired => formatter
+                .write_str("a newer render frame version is required for this terminal profile or presentation state"),
             Self::Unsupported(feature) => {
                 write!(formatter, "unsupported terminal input: {feature}")
             }
@@ -450,6 +602,7 @@ impl Display for InputEncodeError {
             Self::Win32InputModeDisabled => {
                 formatter.write_str("Win32 input event requires DEC private mode 9001")
             }
+            Self::UnsupportedVt52Key(key) => write!(formatter, "key {key:?} has no VT52 encoding"),
             Self::KittyKeyEventRequired => formatter.write_str(
                 "legacy key event is ambiguous while Kitty keyboard enhancements are active",
             ),
@@ -550,9 +703,59 @@ pub struct PreparedApplyWithHostEffectsV2<'a> {
     terminal: &'a mut Terminal,
     candidate: Option<Terminal>,
     host_effect_frame_v2: Vec<u8>,
+    legacy_projection: Vec<u8>,
+}
+
+/// A bounded single-Output candidate. Captures are replayed through the original parser;
+/// no state or host effect reaches the live terminal before `finish().commit_with(...)`.
+pub struct PreparedBrokerOutputV1<'a> {
+    terminal: &'a mut Terminal,
+    source_sequence: u64,
+    output: Vec<u8>,
+    captures: Vec<Arc<kitty_graphics::BrokerCapture>>,
+    capture_bytes: usize,
+    pending: Option<kitty_graphics::BrokerRequest>,
+    ready: Option<(Terminal, Vec<u8>)>,
+    /// Diagnostic produced by the immutable replay candidate when parsing or
+    /// broker replay is rejected.  The live terminal remains unchanged while
+    /// this transaction is pending, so the candidate evidence must travel
+    /// with the preparation instead of being read from `self.terminal`.
+    diagnostic_v3: Option<String>,
+}
+
+/// A broker preparation failure together with the diagnostic captured from
+/// the discarded candidate, when the parser produced one.
+///
+/// The live terminal is never modified by a failed preparation.  Callers that
+/// expose the failure to a host should prefer the diagnostic when present and
+/// fall back to the stable `TerminalError` text for validation failures that
+/// occur before a parser candidate exists.
+#[derive(Debug)]
+pub struct BrokerPrepareError {
+    error: TerminalError,
+    diagnostic_v3: Option<String>,
+}
+
+impl BrokerPrepareError {
+    #[must_use]
+    pub fn into_parts(self) -> (TerminalError, Option<String>) {
+        (self.error, self.diagnostic_v3)
+    }
+}
+
+impl From<TerminalError> for BrokerPrepareError {
+    fn from(error: TerminalError) -> Self {
+        Self {
+            error,
+            diagnostic_v3: None,
+        }
+    }
 }
 
 impl PreparedApplyWithHostEffectsV2<'_> {
+    pub fn take_legacy_projection(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.legacy_projection)
+    }
     #[must_use]
     pub fn host_effect_frame_v2(&self) -> &[u8] {
         &self.host_effect_frame_v2
@@ -574,6 +777,140 @@ impl PreparedApplyWithHostEffectsV2<'_> {
     pub fn publish<E>(self, publisher: impl FnOnce(Vec<u8>) -> Result<(), E>) -> Result<(), E> {
         self.commit_with(publisher)
     }
+}
+
+impl<'a> PreparedBrokerOutputV1<'a> {
+    pub fn request(&self) -> Option<&kitty_graphics::BrokerRequest> {
+        self.pending.as_ref()
+    }
+
+    /// Returns the most recent parser diagnostic captured while rebuilding the
+    /// immutable broker candidate.  This is intentionally separate from the
+    /// live terminal diagnostics: a rejected candidate must never overwrite
+    /// committed state.
+    #[must_use]
+    pub fn failure_diagnostic_v3(&self) -> Option<&str> {
+        self.diagnostic_v3.as_deref()
+    }
+
+    /// A failed supply leaves the request pending, so the caller may retry or cancel.
+    pub fn supply(&mut self, capture: kitty_graphics::BrokerCapture) -> Result<(), TerminalError> {
+        let Some(request) = &self.pending else {
+            return Err(TerminalError::Unsupported(
+                "Kitty broker has no pending request",
+            ));
+        };
+        if capture.request != *request {
+            return Err(TerminalError::Unsupported(
+                "Kitty broker capture request identity mismatch",
+            ));
+        }
+        let bytes = match &capture.outcome {
+            kitty_graphics::BrokerOutcome::Bytes(bytes) => bytes.len(),
+            kitty_graphics::BrokerOutcome::Failure(_) => 0,
+        };
+        if bytes > kitty_graphics::MAX_BROKER_CAPTURE_BYTES
+            || bytes > MAX_BROKER_TRANSACTION_BYTES - self.capture_bytes
+        {
+            return Err(TerminalError::ProtocolResourceLimit(
+                "Kitty broker transaction exceeds 32 MiB",
+            ));
+        }
+        self.captures
+            .try_reserve(1)
+            .map_err(|_| TerminalError::LimitExceeded)?;
+        self.captures.push(Arc::new(capture));
+        let result = self.rebuild_with_diagnostic();
+        match result {
+            Ok(()) => {
+                self.capture_bytes += bytes;
+                Ok(())
+            }
+            Err(failure) => {
+                self.captures.pop();
+                self.diagnostic_v3 = failure.diagnostic_v3;
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// Only a fully resolved transaction can expose a publishable HostEffect frame.
+    pub fn finish(self) -> Result<PreparedApplyWithHostEffectsV2<'a>, TerminalError> {
+        let (candidate, frame) = self.ready.ok_or(TerminalError::BrokerCaptureRequired)?;
+        Ok(PreparedApplyWithHostEffectsV2 {
+            terminal: self.terminal,
+            candidate: Some(candidate),
+            host_effect_frame_v2: frame,
+            legacy_projection: Vec::new(),
+        })
+    }
+
+    fn rebuild_with_diagnostic(&mut self) -> Result<(), BrokerRebuildError> {
+        // shortcut: replay is bounded to 64 requests per 1 MiB Output; use resumable parsing if this becomes hot.
+        let mut candidate = self.terminal.clone();
+        candidate.diagnostics.failure = None;
+        candidate.diagnostics.failure_v2 = None;
+        candidate.diagnostics.expanded_failure_v2 = None;
+        candidate.macro_execution = macros::MacroExecution::default();
+        candidate.broker_replay = Some(BrokerReplay {
+            captures: self.captures.clone(),
+            next_ordinal: 0,
+            pending: None,
+        });
+        let mut effects = host_effect::CaptureV2::default();
+        let result = candidate.apply_output(&self.output, self.source_sequence, Some(&mut effects));
+        let replay = candidate
+            .broker_replay
+            .take()
+            .expect("broker replay installed");
+        match result {
+            Err(TerminalError::BrokerCaptureRequired) => {
+                self.pending = replay.pending;
+                self.ready = None;
+                self.diagnostic_v3 = None;
+                Ok(())
+            }
+            Err(error) => Err(BrokerRebuildError {
+                diagnostic_v3: candidate.failure_diagnostic_v3(),
+                error,
+            }),
+            Ok(()) => {
+                if replay.next_ordinal as usize != self.captures.len() {
+                    return Err(BrokerRebuildError {
+                        diagnostic_v3: candidate.failure_diagnostic_v3(),
+                        error: TerminalError::Unsupported(
+                            "Kitty broker capture count exceeds parsed requests",
+                        ),
+                    });
+                }
+                candidate.main.canonicalize_cursor_cells();
+                candidate.alternate.canonicalize_cursor_cells();
+                for page in candidate.pages.screens_mut() {
+                    page.canonicalize_cursor_cells();
+                }
+                candidate.next_source_sequence += 1;
+                candidate.macro_execution = macros::MacroExecution::default();
+                let frame = match effects.encode_v2() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        return Err(BrokerRebuildError {
+                            diagnostic_v3: candidate.failure_diagnostic_v3(),
+                            error,
+                        });
+                    }
+                };
+                self.ready = Some((candidate, frame));
+                self.pending = None;
+                self.diagnostic_v3 = None;
+                Ok(())
+            }
+        }
+    }
+}
+
+struct BrokerRebuildError {
+    error: TerminalError,
+    diagnostic_v3: Option<String>,
 }
 
 impl PreparedApplyWithHostEffectsV1<'_> {
@@ -659,6 +996,14 @@ impl Terminal {
                 MAX_CELLS,
             ),
             alternate: Screen::new(columns, rows),
+            pages: pages::PageStore::default(),
+            host_geometry: HostGeometryV1::default(),
+            shell_integration: ShellIntegration::default(),
+            host_signals: HostSignalsV1::default(),
+            graphics: None,
+            kitty_transfer: kitty_graphics::TransferDecoder::default(),
+            broker_replay: None,
+            legacy_projection: None,
             active_alternate: false,
             cursor_visible: true,
             cursor_shape: CursorShape::Block,
@@ -669,6 +1014,7 @@ impl Terminal {
             margins: Margins::full(columns, rows),
             tabs: TabStops::new(columns),
             charset: CharsetState::default(),
+            user_preferred_charset: charset::CharsetDesignation::LATIN1,
             main_saved_charset: CharsetState::default(),
             alternate_saved_charset: CharsetState::default(),
             osc: OscState::default(),
@@ -680,8 +1026,39 @@ impl Terminal {
             utf8: Utf8Decoder::default(),
             string_utf8: StringUtf8Boundary::default(),
             repeat_source: None,
+            sgr_stack: sgr_stack::SgrStack::default(),
+            macros: macros::MacroStore::default(),
+            macro_execution: macros::MacroExecution::default(),
             failed_closed: false,
+            diagnostics: diagnostic::OutputDiagnostics::default(),
         })
+    }
+
+    /// Width rules are fixed at creation; existing constructors retain the legacy profile.
+    pub fn new_with_profiles(
+        columns: u32,
+        rows: u32,
+        initial_source_sequence: u64,
+        options: TerminalOptions,
+        output_profile: OutputProfile,
+        width_profile: WidthProfile,
+    ) -> Result<Self, TerminalError> {
+        let mut terminal = Self::new_with_output_profile(
+            columns,
+            rows,
+            initial_source_sequence,
+            options,
+            output_profile,
+        )?;
+        terminal.main.width_profile = width_profile;
+        terminal.alternate.width_profile = width_profile;
+        terminal.modes.grapheme_clustering = width_profile == WidthProfile::Unicode16;
+        Ok(terminal)
+    }
+
+    #[must_use]
+    pub fn width_profile(&self) -> WidthProfile {
+        self.main.width_profile
     }
 
     pub fn apply_event(&mut self, event: Event<'_>) -> Result<(), TerminalError> {
@@ -699,6 +1076,9 @@ impl Terminal {
         if self.failed_closed {
             return Err(TerminalError::FailedClosed);
         }
+        self.diagnostics.failure = None;
+        self.diagnostics.failure_v2 = None;
+        self.diagnostics.expanded_failure_v2 = None;
         if events.is_empty() {
             return Ok(());
         }
@@ -735,6 +1115,9 @@ impl Terminal {
         if self.failed_closed {
             return Err(TerminalError::FailedClosed);
         }
+        self.diagnostics.failure = None;
+        self.diagnostics.failure_v2 = None;
+        self.diagnostics.expanded_failure_v2 = None;
         if events.len() > MAX_CAPTURE_EVENT_COUNT {
             return Err(TerminalError::LimitExceeded);
         }
@@ -776,19 +1159,156 @@ impl Terminal {
         self.prepare_events_atomic_with_host_effects_v2(std::slice::from_ref(&event))
     }
 
+    /// Replays a single bounded Output through the real parser after each immutable broker
+    /// capture. Holding the preparation prevents the live baseline from changing meanwhile.
+    pub fn prepare_output_with_broker_v1(
+        &mut self,
+        source_sequence: u64,
+        bytes: &[u8],
+    ) -> Result<PreparedBrokerOutputV1<'_>, TerminalError> {
+        self.prepare_output_with_broker_captures_v1(source_sequence, bytes, &[])
+    }
+
+    /// Diagnostic-preserving variant of [`Self::prepare_output_with_broker_v1`].
+    ///
+    /// The compatibility method above intentionally keeps its historical error
+    /// type. FFI callers that need the parser-produced TL-DIAG/3 evidence use
+    /// this additive entry point instead.
+    pub fn prepare_output_with_broker_v1_with_diagnostic(
+        &mut self,
+        source_sequence: u64,
+        bytes: &[u8],
+    ) -> Result<PreparedBrokerOutputV1<'_>, BrokerPrepareError> {
+        self.prepare_output_with_broker_captures_v1_with_diagnostic(
+            source_sequence,
+            bytes,
+            &[],
+        )
+    }
+
+    /// Replays one Output once with a bounded prefix of immutable captures. The parser verifies
+    /// each supplied request in source order and returns the next request if the prefix is short.
+    pub fn prepare_output_with_broker_captures_v1(
+        &mut self,
+        source_sequence: u64,
+        bytes: &[u8],
+        captures: &[kitty_graphics::BrokerCapture],
+    ) -> Result<PreparedBrokerOutputV1<'_>, TerminalError> {
+        self.prepare_output_with_broker_captures_v1_with_diagnostic(source_sequence, bytes, captures)
+            .map_err(|failure| failure.into_parts().0)
+    }
+
+    /// Diagnostic-preserving variant of
+    /// [`Self::prepare_output_with_broker_captures_v1`]. The candidate replay
+    /// owns any parser evidence so a rejected transaction never mutates the
+    /// live terminal's diagnostics.
+    pub fn prepare_output_with_broker_captures_v1_with_diagnostic(
+        &mut self,
+        source_sequence: u64,
+        bytes: &[u8],
+        captures: &[kitty_graphics::BrokerCapture],
+    ) -> Result<PreparedBrokerOutputV1<'_>, BrokerPrepareError> {
+        if self.failed_closed {
+            return Err(TerminalError::FailedClosed.into());
+        }
+        if source_sequence != self.next_source_sequence {
+            return Err(TerminalError::SequenceMismatch {
+                expected: self.next_source_sequence,
+                actual: source_sequence,
+            }
+            .into());
+        }
+        if source_sequence >= u64::MAX - 1 {
+            return Err(TerminalError::SequenceExhausted.into());
+        }
+        if bytes.len() > MAX_OUTPUT_BYTES {
+            return Err(TerminalError::LimitExceeded.into());
+        }
+        if captures.len() > usize::from(kitty_graphics::MAX_BROKER_REQUESTS_PER_OUTPUT) {
+            return Err(TerminalError::ProtocolResourceLimit(
+                "Kitty broker request count exceeds 64 per Output",
+            )
+            .into());
+        }
+        let mut capture_bytes = 0;
+        for capture in captures {
+            let bytes = match &capture.outcome {
+                kitty_graphics::BrokerOutcome::Bytes(bytes) => bytes.len(),
+                kitty_graphics::BrokerOutcome::Failure(_) => 0,
+            };
+            if bytes > kitty_graphics::MAX_BROKER_CAPTURE_BYTES
+                || bytes > MAX_BROKER_TRANSACTION_BYTES - capture_bytes
+            {
+                return Err(TerminalError::ProtocolResourceLimit(
+                    "Kitty broker transaction exceeds 32 MiB",
+                )
+                .into());
+            }
+            capture_bytes += bytes;
+        }
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| BrokerPrepareError::from(TerminalError::LimitExceeded))?;
+        output.extend_from_slice(bytes);
+        let mut owned_captures = Vec::new();
+        owned_captures
+            .try_reserve_exact(captures.len())
+            .map_err(|_| BrokerPrepareError::from(TerminalError::LimitExceeded))?;
+        owned_captures.extend(captures.iter().cloned().map(Arc::new));
+        let mut preparation = PreparedBrokerOutputV1 {
+            terminal: self,
+            source_sequence,
+            output,
+            captures: owned_captures,
+            capture_bytes,
+            pending: None,
+            ready: None,
+            diagnostic_v3: None,
+        };
+        preparation
+            .rebuild_with_diagnostic()
+            .map_err(|failure| BrokerPrepareError {
+                error: failure.error,
+                diagnostic_v3: failure.diagnostic_v3,
+            })?;
+        Ok(preparation)
+    }
+
     /// Prepares up to 256 source events using the V2 host-effect profile.
     /// Publication must succeed before the candidate terminal is committed.
     pub fn prepare_events_atomic_with_host_effects_v2<'a>(
         &'a mut self,
         events: &[Event<'_>],
     ) -> Result<PreparedApplyWithHostEffectsV2<'a>, TerminalError> {
+        self.prepare_effects_v2(events, false)
+    }
+
+    /// Display-only normalized bytes, generated by the same parser and transaction as the state.
+    /// BEL/DECPS/OSC 9/52 never reach an outer terminal. Macros expand through the authority.
+    pub fn prepare_event_with_legacy_projection<'a>(
+        &'a mut self,
+        event: Event<'_>,
+    ) -> Result<PreparedApplyWithHostEffectsV2<'a>, TerminalError> {
+        self.prepare_effects_v2(std::slice::from_ref(&event), true)
+    }
+
+    fn prepare_effects_v2<'a>(
+        &'a mut self,
+        events: &[Event<'_>],
+        project: bool,
+    ) -> Result<PreparedApplyWithHostEffectsV2<'a>, TerminalError> {
         if self.failed_closed {
             return Err(TerminalError::FailedClosed);
         }
+        self.diagnostics.failure = None;
+        self.diagnostics.failure_v2 = None;
+        self.diagnostics.expanded_failure_v2 = None;
         validate_capture_events(events)?;
 
         let mut capture = host_effect::CaptureV2::default();
-        let candidate = match self.build_candidate(events, Some(&mut capture)) {
+        let result = self.build_projected_candidate(events, Some(&mut capture), project);
+        let mut candidate = match result {
             Ok(candidate) => candidate,
             Err((error, poison)) => {
                 if poison {
@@ -798,19 +1318,38 @@ impl Terminal {
             }
         };
         let host_effect_frame_v2 = capture.encode_v2()?;
+        let legacy_projection = candidate
+            .legacy_projection
+            .take()
+            .map_or_else(Vec::new, |p| p.bytes);
         Ok(PreparedApplyWithHostEffectsV2 {
             terminal: self,
             candidate: Some(candidate),
             host_effect_frame_v2,
+            legacy_projection,
         })
     }
 
     fn build_candidate<C: host_effect::CaptureSink>(
-        &self,
+        &mut self,
+        events: &[Event<'_>],
+        capture: Option<&mut C>,
+    ) -> Result<Self, (TerminalError, bool)> {
+        self.build_projected_candidate(events, capture, false)
+    }
+
+    fn build_projected_candidate<C: host_effect::CaptureSink>(
+        &mut self,
         events: &[Event<'_>],
         mut capture: Option<&mut C>,
+        project: bool,
     ) -> Result<Self, (TerminalError, bool)> {
         let mut candidate = self.clone();
+        candidate.legacy_projection = project.then(legacy_projection::Projection::default);
+        candidate.diagnostics.failure = None;
+        candidate.diagnostics.failure_v2 = None;
+        candidate.diagnostics.expanded_failure_v2 = None;
+        candidate.macro_execution = macros::MacroExecution::default();
         for &event in events {
             let actual = event.source_sequence();
             if matches!(event, Event::Gap { .. }) {
@@ -840,9 +1379,19 @@ impl Terminal {
 
             let result = match event {
                 Event::Output { bytes, .. } => {
+                    candidate.macro_execution.expanded_bytes = 0;
                     candidate.apply_output(bytes, actual, capture.as_deref_mut())
                 }
                 Event::Resize { columns, rows, .. } => candidate.resize(columns, rows),
+                Event::HostGeometry { geometry, .. } => geometry.validate().map(|()| {
+                    candidate.host_geometry = geometry;
+                }),
+                Event::HostTheme { bytes, .. } => candidate.apply_host_theme(
+                    bytes,
+                    capture
+                        .as_deref_mut()
+                        .map(|value| value as &mut dyn host_effect::CaptureSink),
+                ),
                 Event::Advance { micros, .. } => candidate.advance(micros),
                 Event::Gap { .. } => unreachable!("gap handled before transaction"),
             };
@@ -855,21 +1404,95 @@ impl Terminal {
                     // exported checkpoint is accepted by the strict reader.
                     candidate.main.canonicalize_cursor_cells();
                     candidate.alternate.canonicalize_cursor_cells();
+                    for page in candidate.pages.screens_mut() {
+                        page.canonicalize_cursor_cells();
+                    }
                     candidate.next_source_sequence += 1;
                 }
-                Err(error @ TerminalError::Unsupported(_)) => return Err((error, true)),
+                Err(
+                    error @ (TerminalError::Unsupported(_)
+                    | TerminalError::UnsupportedPayload { .. }
+                    | TerminalError::UnsupportedDecodedPayload { .. }),
+                ) => {
+                    self.diagnostics.failure = candidate.diagnostics.failure.take();
+                    self.diagnostics.failure_v2 = candidate.diagnostics.failure_v2.take();
+                    self.diagnostics.expanded_failure_v2 =
+                        candidate.diagnostics.expanded_failure_v2.take();
+                    return Err((error, true));
+                }
                 Err(error @ TerminalError::HostEffectVersionRequired) => {
                     return Err((error, false));
                 }
-                Err(error) => return Err((error, false)),
+                Err(error) => {
+                    self.diagnostics.failure = candidate.diagnostics.failure.take();
+                    self.diagnostics.failure_v2 = candidate.diagnostics.failure_v2.take();
+                    self.diagnostics.expanded_failure_v2 =
+                        candidate.diagnostics.expanded_failure_v2.take();
+                    return Err((error, false));
+                }
             }
         }
+        candidate.macro_execution = macros::MacroExecution::default();
         Ok(candidate)
     }
 
     pub fn export_snapshot_v2(&self) -> Result<Vec<u8>, TerminalError> {
         self.ensure_presentation_eligible()?;
         snapshot::export(self)
+    }
+
+    /// Bounded, ASCII-only evidence of a failed output operation, readable even
+    /// after failed-closed. Never execute this text as terminal control data.
+    #[must_use]
+    pub fn failure_diagnostic_v1(&self) -> Option<&str> {
+        self.diagnostics.failure.as_deref()
+    }
+
+    /// V2 adds physical detection coordinates and build/profile identity. The
+    /// host supplies its role and live/replay context; the core cannot infer them.
+    #[must_use]
+    pub fn failure_diagnostic_v2(&self) -> Option<String> {
+        self.diagnostics.failure_v2.as_ref().map(|text| {
+            format!(
+                "{text}core_impact={}\n",
+                if self.failed_closed {
+                    "failed_closed"
+                } else {
+                    "operation_rejected"
+                }
+            )
+        })
+    }
+
+    /// V3 adds separately labeled macro-byte coordinates. Ordinary output keeps
+    /// its V2 encoding; V1/V2 consumers still receive the physical invocation.
+    #[must_use]
+    pub fn failure_diagnostic_v3(&self) -> Option<String> {
+        let original = self.failure_diagnostic_v2()?;
+        let Some(expanded) = &self.diagnostics.expanded_failure_v2 else {
+            return Some(original);
+        };
+        let mut text = original.replacen("TL-DIAG/2\n", "TL-DIAG/3\n", 1);
+        text.push_str(if expanded.origins.is_some() {
+            "expanded_source=mixed\n"
+        } else {
+            "expanded_source=macro\n"
+        });
+        if let Some(origins) = &expanded.origins {
+            text.push_str(origins);
+        }
+        for line in expanded.text.lines().skip(1) {
+            text.push_str("expanded_");
+            text.push_str(line);
+            text.push('\n');
+        }
+        text.push_str(if self.failed_closed {
+            "expanded_core_impact=failed_closed\n"
+        } else {
+            "expanded_core_impact=operation_rejected\n"
+        });
+        debug_assert!(text.len() <= diagnostic::MAX_DIAGNOSTIC_V3_BYTES);
+        Some(text)
     }
 
     pub fn import_snapshot_v2(bytes: &[u8]) -> Result<Self, TerminalError> {
@@ -895,12 +1518,17 @@ impl Terminal {
         render_frame::export_v3(self)
     }
 
+    /// Renderer-only text frame with an explicit frozen width profile.
+    pub fn export_render_frame_v4(&self) -> Result<Vec<u8>, TerminalError> {
+        render_frame::export_v4(self)
+    }
+
     /// Returns the retained active-screen scrollback row count and a
     /// runtime-only monotonic count of rows captured into primary scrollback.
     /// Alternate-screen applications intentionally expose no local history.
     #[must_use]
     pub fn scrollback_info(&self) -> (u32, u64) {
-        if self.active_alternate {
+        if self.active_alternate || self.pages.visible != 1 {
             (0, self.main.scrollback_generation_rows())
         } else {
             (
@@ -924,6 +1552,19 @@ impl Terminal {
         render_frame::export_v3_at_scrollback(self, offset_rows)
     }
 
+    /// Exports a V4 window above the live tail, clamped to retained history.
+    pub fn export_render_frame_v4_at_scrollback(
+        &self,
+        offset_rows: u32,
+    ) -> Result<Vec<u8>, TerminalError> {
+        let offset_rows = offset_rows.min(self.scrollback_info().0);
+        if offset_rows == 0 {
+            render_frame::export_v4(self)
+        } else {
+            render_frame::export_v4_at_scrollback(self, offset_rows)
+        }
+    }
+
     /// Encodes one semantic keyboard or paste event using the terminal's
     /// current input modes. This operation does not mutate terminal state.
     pub fn encode_input(&self, event: InputEvent<'_>) -> Result<Vec<u8>, InputEncodeError> {
@@ -938,6 +1579,17 @@ impl Terminal {
                 columns: self.columns,
                 rows: self.rows,
             });
+        }
+        if let InputEvent::Mouse(mouse) = event
+            && self.active_alternate
+            && self.modes.alternate_scroll
+            && self.modes.mouse_tracking == modes::MouseTracking::None
+        {
+            return input::encode_alternate_scroll(
+                mouse,
+                &self.modes,
+                self.active_keyboard_protocol().flags(),
+            );
         }
         input::encode_input(event, &self.modes, self.active_keyboard_protocol().flags())
     }
@@ -968,7 +1620,10 @@ impl Terminal {
     /// UTF-8 boundary.
     #[must_use]
     pub fn is_parser_incomplete(&self) -> bool {
-        !self.parser.is_ground() || self.utf8.len != 0 || self.string_utf8.remaining != 0
+        !self.parser.is_ground()
+            || self.utf8.len != 0
+            || self.string_utf8.remaining != 0
+            || self.kitty_transfer.is_pending()
     }
 
     #[must_use]
@@ -1025,7 +1680,7 @@ impl Terminal {
         if self.active_alternate {
             &self.alternate
         } else {
-            &self.main
+            self.pages.screen(&self.main, self.pages.active)
         }
     }
 
@@ -1033,7 +1688,7 @@ impl Terminal {
         if self.active_alternate {
             &mut self.alternate
         } else {
-            &mut self.main
+            self.pages.screen_mut(&mut self.main, self.pages.active)
         }
     }
 
@@ -1064,25 +1719,96 @@ impl Terminal {
         }
         for (offset, &byte) in bytes.iter().enumerate() {
             let effect = capture.as_deref_mut().map(|capture| EffectContext {
+                send_c1: self.modes.send_c1 && !self.modes.vt52,
                 capture,
                 source_sequence,
                 source_offset_end: u32::try_from(offset + 1).expect("output offset fits u32"),
             });
-            self.process_byte(byte, effect)?;
+            let sensitive = !self.parser.is_public_control_payload()
+                && (self.parser.is_string_payload()
+                    || matches!(
+                        self.parser,
+                        ParserState::OscEscape(_)
+                            | ParserState::DcsEscape(_)
+                            | ParserState::ApcEscape(_)
+                            | ParserState::IgnoredStringEscape(_)
+                    ));
+            let restart = (self.parser.is_ground() && self.utf8.len == 0)
+                || (byte == 0x1b && !self.parser.is_string_state());
+            if let Some(physical) = &mut self.diagnostics.physical_trace {
+                physical.observe(byte, source_sequence, offset as u32, restart, sensitive);
+            }
+            self.diagnostics.trace.observe(
+                byte,
+                source_sequence,
+                offset as u32,
+                restart,
+                sensitive,
+            );
+            if let Err(error) = self.process_byte(byte, effect) {
+                self.diagnostics.expanded_failure_v2 = self.diagnostics.trace.expanded_diagnostic(
+                    &error,
+                    self.output_profile,
+                    self.width_profile(),
+                );
+                let trace = if self.diagnostics.expanded_failure_v2.is_some() {
+                    self.diagnostics
+                        .physical_trace
+                        .as_ref()
+                        .unwrap_or(&self.diagnostics.trace)
+                } else {
+                    &self.diagnostics.trace
+                };
+                self.diagnostics.failure = trace.diagnostic(&error);
+                self.diagnostics.failure_v2 =
+                    trace.diagnostic_v2(&error, self.output_profile, self.width_profile());
+                return Err(error);
+            }
+            if self.parser.is_ground() && self.utf8.len == 0 {
+                self.diagnostics.trace.clear();
+                self.diagnostics.physical_trace = None;
+            }
+        }
+        if self.graphics.is_some() {
+            let cell_resources = self.cell_graphic_resources();
+            if let Some(graphics) = &mut self.graphics {
+                graphics.collect_unused(&cell_resources)?;
+            }
         }
         Ok(())
     }
 
     fn resize(&mut self, columns: u32, rows: u32) -> Result<(), TerminalError> {
         validate_dimensions(columns, rows)?;
-        if !self.active_alternate {
-            if self.modes.left_right_margin {
-                self.main.resize_crop(columns, rows);
-            } else {
-                self.main.resize_reflow(columns, rows)?;
+        if self.pages.screens().count() * columns as usize * rows as usize > pages::MAX_EXTRA_CELLS
+        {
+            return Err(TerminalError::ProtocolResourceLimit(
+                "DEC page resize exceeds 32768 additional cells",
+            ));
+        }
+        for page in 2..=6 {
+            if self.pages.extra[usize::from(page - 2)].is_some() {
+                self.with_page_graphics_motion(page, GraphicMotion::Reflow, |screen| {
+                    screen.resize_crop(columns, rows);
+                    Ok(())
+                })?;
             }
         }
-        self.alternate.resize_crop(columns, rows);
+        if !self.active_alternate {
+            let crop = self.modes.left_right_margin;
+            self.with_page_graphics_motion(1, GraphicMotion::Reflow, |screen| {
+                if crop {
+                    screen.resize_crop(columns, rows);
+                    Ok(())
+                } else {
+                    screen.resize_reflow(columns, rows)
+                }
+            })?;
+        }
+        self.with_page_graphics_motion(7, GraphicMotion::Reflow, |screen| {
+            screen.resize_crop(columns, rows);
+            Ok(())
+        })?;
         self.margins.resize(columns, rows);
         debug_assert!(self.margins.validate(columns, rows));
         let resized_tabs = self.tabs.resize(columns);
@@ -1126,26 +1852,40 @@ impl Terminal {
         mut effect: Option<EffectContext<'_>>,
     ) -> Result<(), TerminalError> {
         if self.utf8.len != 0 && byte & 0xc0 != 0x80 {
+            // A removed bell/macro/string must not join previously emitted partial UTF-8
+            // with later bytes in the outer renderer. ST is an inert ground-state barrier.
+            if let Some(projection) = &mut self.legacy_projection {
+                projection.push(b"\x1b\\")?;
+            }
             self.utf8.clear();
             self.process_character('\u{fffd}')?;
         }
 
-        let at_utf8_boundary = if self.parser.is_string_payload() {
+        let at_utf8_boundary = if self.modes.iso2022 {
+            self.string_utf8.clear();
+            true
+        } else if self.parser.is_string_payload() {
             self.string_utf8.observe(byte)
         } else {
             self.string_utf8.clear();
             !(self.parser.is_ground() && self.utf8.len != 0 && byte & 0xc0 == 0x80)
         };
 
-        if self.output_profile == OutputProfile::Utf8WithStandaloneC1
-            && at_utf8_boundary
-            && (0x80..=0x9f).contains(&byte)
-        {
+        let receive_c1 = match self.modes.receive_c1 {
+            1 => true,
+            2 => false,
+            _ => self.output_profile == OutputProfile::Utf8WithStandaloneC1,
+        };
+        if receive_c1 && !self.modes.vt52 && at_utf8_boundary && (0x80..=0x9f).contains(&byte) {
+            self.diagnostics.trace.mark_standalone_c1();
             // One physical C1 byte is two virtual parser bytes. Both retain
             // the same source key while each resulting action is dispatched
             // in order; the enclosing candidate transaction remains atomic.
             let first_effect = effect.as_mut().map(EffectContext::reborrow);
             self.process_parser_byte(0x1b, first_effect)?;
+            if matches!(self.parser, ParserState::Escape(_)) {
+                self.diagnostics.trace.restart_escape();
+            }
             return self.process_parser_byte(byte - 0x40, effect);
         }
 
@@ -1157,12 +1897,64 @@ impl Terminal {
         byte: u8,
         effect: Option<EffectContext<'_>>,
     ) -> Result<(), TerminalError> {
+        if byte == 0x7f && self.parser.is_ground() {
+            if let Some(mapped) = self.charset.map_delete_metadata(
+                self.modes.national_replacement_character_set_mode,
+                self.user_preferred_charset,
+            ) {
+                if let Some(projection) = &mut self.legacy_projection {
+                    projection.push(&[0x7f])?;
+                }
+                self.process_mapped_graphic(mapped)?;
+            }
+            return Ok(());
+        }
+        if self.modes.vt52 && byte == 0x1b {
+            self.parser = ParserState::Vt52Escape;
+            self.repeat_source = None;
+            return Ok(());
+        }
         let was_ground = self.parser.is_ground();
-        let action = self.parser.advance(byte).map_err(map_parse_error)?;
+        let fresh_escape = matches!(
+            self.parser,
+            ParserState::OscEscape(_)
+                | ParserState::DcsEscape(_)
+                | ParserState::ApcEscape(_)
+                | ParserState::IgnoredStringEscape(_)
+        ) && !matches!(byte, 0 | 0x18 | 0x1a | 0x7f | b'\\')
+            && (byte != 7 || matches!(self.parser, ParserState::ApcEscape(_)))
+            && !(matches!(self.parser, ParserState::IgnoredStringEscape(_))
+                && byte < 0x20
+                && byte != 0x1b);
+        let parsed = if self.graphics.is_some() {
+            self.parser.advance_with_graphics(byte, true)
+        } else {
+            self.parser.advance(byte)
+        };
+        let action = match parsed {
+            Ok(action) => action,
+            Err(error) => {
+                if fresh_escape {
+                    self.diagnostics.trace.restart_escape();
+                }
+                return Err(map_parse_error(error));
+            }
+        };
+        let completes_string = matches!(
+            action,
+            Action::Sequence(Sequence::Dcs(_) | Sequence::Osc(_) | Sequence::Apc(_))
+        );
+        if fresh_escape && !completes_string {
+            self.diagnostics.trace.restart_escape();
+        }
         if !was_ground && self.parser.is_ground() && matches!(action, Action::None) {
             self.repeat_source = None;
         }
-        self.dispatch_action(action, effect)
+        self.dispatch_action(action, effect)?;
+        if fresh_escape && completes_string {
+            self.diagnostics.trace.restart_escape();
+        }
+        Ok(())
     }
 
     fn dispatch_action(
@@ -1170,12 +1962,23 @@ impl Terminal {
         action: Action,
         effect: Option<EffectContext<'_>>,
     ) -> Result<(), TerminalError> {
+        let empty_repeat = matches!(&action, Action::Sequence(Sequence::Csi(csi)) if Self::is_repeat_sequence(csi))
+            && self.repeat_source.is_none();
+        if !empty_repeat && let Some(projection) = &mut self.legacy_projection {
+            projection.observe(&action)?;
+        }
         match action {
+            Action::Vt52 { command, address } => self.dispatch_vt52(command, address, effect),
             Action::None => Ok(()),
             Action::Print(byte) => self.process_print_byte(byte),
             Action::Execute(byte) => {
                 self.repeat_source = None;
-                self.execute_control(byte)
+                self.execute_control(byte)?;
+                if byte == 0x07 {
+                    host_signals::bell(effect)?;
+                }
+                self.revalidate_active_wrap_pending();
+                Ok(())
             }
             Action::Sequence(sequence) => match sequence {
                 Sequence::Csi(sequence) if Self::is_repeat_sequence(&sequence) => {
@@ -1183,11 +1986,29 @@ impl Terminal {
                 }
                 Sequence::Esc(sequence) => {
                     self.repeat_source = None;
-                    self.dispatch_escape(sequence)
+                    self.dispatch_escape(sequence)?;
+                    if self.active_screen().has_line_renditions() {
+                        self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                            screen.finish_line_edit()
+                        })?;
+                    }
+                    self.revalidate_active_wrap_pending();
+                    Ok(())
                 }
                 Sequence::Csi(sequence) => {
                     self.repeat_source = None;
-                    self.dispatch_csi(sequence, effect)
+                    self.dispatch_csi(sequence, effect)?;
+                    if self.active_screen().has_line_renditions() {
+                        let reset = self.modes.left_right_margin;
+                        self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                            if reset {
+                                screen.reset_visible_line_renditions();
+                            }
+                            screen.finish_line_edit()
+                        })?;
+                    }
+                    self.revalidate_active_wrap_pending();
+                    Ok(())
                 }
                 Sequence::Osc(sequence) => {
                     self.repeat_source = None;
@@ -1196,6 +2017,10 @@ impl Terminal {
                 Sequence::Dcs(sequence) => {
                     self.repeat_source = None;
                     self.dispatch_dcs(sequence, effect)
+                }
+                Sequence::Apc(sequence) => {
+                    self.repeat_source = None;
+                    self.dispatch_kitty(sequence.bytes(), effect)
                 }
             },
         }
@@ -1210,16 +2035,25 @@ impl Terminal {
     }
 
     fn process_print_byte(&mut self, byte: u8) -> Result<(), TerminalError> {
+        if self.modes.iso2022 && byte >= 0xa0 {
+            let mapped = self.charset.map_gr_metadata(
+                byte,
+                self.modes.national_replacement_character_set_mode,
+                self.user_preferred_charset,
+            )?;
+            return self.process_mapped_graphic(mapped);
+        }
         if self.utf8.len == 0 {
             if (b' '..=b'~').contains(&byte) {
-                let character = self
+                let mapped = self
                     .charset
-                    .map_graphic_with_national_replacement(
+                    .map_graphic_metadata(
                         byte,
                         self.modes.national_replacement_character_set_mode,
+                        self.user_preferred_charset,
                     )
                     .map_err(|_| TerminalError::Unsupported("charset graphic mapping"))?;
-                self.process_character(character)?;
+                self.process_mapped_graphic(mapped)?;
             } else if byte <= 0x7f {
                 self.process_character(char::from(byte))?;
             } else if let Some(expected) = utf8_sequence_length(byte) {
@@ -1250,15 +2084,14 @@ impl Terminal {
 
     fn execute_control(&mut self, byte: u8) -> Result<(), TerminalError> {
         match byte {
-            // ENQ and BEL normally require a host-side response or notification. The mirror
-            // core has no host-effect ABI, so their deterministic terminal-state effect is none.
+            // ENQ is ignored; BEL is emitted by the caller through the versioned capture.
             0x05 | 0x07 => {}
             b'\r' => self.carriage_return_active(),
             b'\n' | 0x0b | 0x0c => {
                 if self.modes.newline_mode {
                     self.carriage_return_active();
                 }
-                self.line_feed_active();
+                self.line_feed_active()?;
             }
             // Software flow control is handled outside the mirror state engine.
             0x11 | 0x13 => {}
@@ -1288,14 +2121,35 @@ impl Terminal {
     }
 
     fn print_terminal_character(&mut self, character: char) -> Result<(), TerminalError> {
+        self.print_terminal_character_with_join(character, true)
+    }
+
+    fn print_terminal_character_with_join(
+        &mut self,
+        character: char,
+        join_previous: bool,
+    ) -> Result<(), TerminalError> {
+        self.print_terminal_graphic(character, None, join_previous)
+    }
+
+    fn print_terminal_graphic(
+        &mut self,
+        character: char,
+        glyph: Option<drcs_bank::GlyphReference>,
+        join_previous: bool,
+    ) -> Result<(), TerminalError> {
         let modes = self.modes;
         let margins = self.margins;
         let (left, right) = self.scrolling_horizontal_bounds();
         let hyperlink = self.osc.current_hyperlink();
         let revision = self.next_source_sequence + 1;
-        self.active_screen_mut()
-            .print_in_rectangle_with_mode_and_scroll_cause(
+        // Controls end the streaming cluster. Zero-width marks may still attach
+        // to a preceding visible base (for example across an SGR change).
+        let clustering = modes.grapheme_clustering && self.repeat_source.is_some();
+        self.with_graphics_motion(GraphicMotion::Observed, |screen| {
+            screen.print_graphic_in_rectangle(
                 character,
+                glyph,
                 modes.insert_mode,
                 modes.auto_wrap,
                 margins.top,
@@ -1304,11 +2158,31 @@ impl Terminal {
                 right,
                 hyperlink,
                 ScrollCause::Output(revision),
-            )?;
+                clustering,
+                join_previous,
+            )
+        })?;
         Ok(())
     }
 
     fn update_repeat_source(&mut self, character: char) -> Result<(), TerminalError> {
+        let profile = self.width_profile();
+        if profile == WidthProfile::Unicode16 || self.graphics.is_some() {
+            let (left, right) = self.scrolling_horizontal_bounds();
+            let screen = self.active_screen();
+            self.repeat_source = screen
+                .previous_lead_index(self.modes.auto_wrap, left, right)
+                .map(|index| {
+                    let cell = &screen.cells[index];
+                    RepeatSource {
+                        character: cell.character,
+                        combining: cell.combining.clone(),
+                        width: cell.width,
+                        glyph: cell.glyph,
+                    }
+                });
+            return Ok(());
+        }
         let width = scalar_width(character);
         let extends_joined = width == 2
             && self
@@ -1318,7 +2192,7 @@ impl Terminal {
                 == Some('\u{200d}');
         if width == 0 || extends_joined {
             if let Some(source) = &mut self.repeat_source {
-                source.append(character)?;
+                source.append(character, profile)?;
             }
         } else {
             self.repeat_source = Some(RepeatSource::new(character));
@@ -1331,9 +2205,22 @@ impl Terminal {
             return Ok(());
         };
         for _ in 0..count {
-            self.print_terminal_character(source.character)?;
+            if source.glyph.is_some() {
+                self.print_terminal_graphic(source.character, source.glyph, false)?;
+                continue;
+            }
+            if self.width_profile() == WidthProfile::Unicode16 {
+                self.repeat_source = None;
+                self.print_terminal_character_with_join(source.character, false)?;
+                self.update_repeat_source(source.character)?;
+            } else {
+                self.print_terminal_character(source.character)?;
+            }
             for character in source.combining.chars() {
                 self.print_terminal_character(character)?;
+                if self.width_profile() == WidthProfile::Unicode16 {
+                    self.update_repeat_source(character)?;
+                }
             }
         }
         self.repeat_source = None;
@@ -1341,6 +2228,54 @@ impl Terminal {
     }
 
     fn dispatch_escape(&mut self, sequence: EscSequence) -> Result<(), TerminalError> {
+        if sequence.intermediates() == b" " && sequence.final_byte() == b'7' {
+            self.modes.receive_c1 = 1;
+            return Ok(());
+        }
+        if sequence.intermediates() == b" " && matches!(sequence.final_byte(), b'F' | b'G') {
+            self.modes.send_c1 = sequence.final_byte() == b'G';
+            return Ok(());
+        }
+        if sequence.intermediates() == b"%" {
+            match sequence.final_byte() {
+                b'@' => {
+                    self.modes.iso2022 = true;
+                    self.modes.receive_c1 = 1;
+                }
+                b'G' | b'8' => {
+                    self.modes.iso2022 = false;
+                    self.modes.receive_c1 = 2;
+                }
+                _ => return Err(TerminalError::Unsupported("coding system designation")),
+            }
+            self.utf8.clear();
+            self.string_utf8.clear();
+            return Ok(());
+        }
+        if sequence.intermediates() == b"#" {
+            let rendition = match sequence.final_byte() {
+                b'3' => LineRendition::DoubleHeightTop,
+                b'4' => LineRendition::DoubleHeightBottom,
+                b'5' => LineRendition::SingleWidth,
+                b'6' => LineRendition::DoubleWidth,
+                b'8' => {
+                    self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                        screen.alignment_pattern()
+                    })?;
+                    self.modes.origin_mode = false;
+                    self.modes.left_right_margin = false;
+                    self.margins = Margins::full(self.columns, self.rows);
+                    return Ok(());
+                }
+                _ => return Err(TerminalError::Unsupported("DEC line rendition selector")),
+            };
+            if !self.modes.left_right_margin {
+                self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                    screen.set_line_rendition(rendition)
+                })?;
+            }
+            return Ok(());
+        }
         if let Some(&intermediate) = sequence.intermediates().first() {
             let (register, size) = match intermediate {
                 b'(' => (GraphicRegister::G0, CharsetSize::Characters94),
@@ -1354,28 +2289,43 @@ impl Terminal {
             };
             return self
                 .charset
-                .designate_with_prefix(
+                .designate_with_soft(
                     register,
                     size,
                     &sequence.intermediates()[1..],
                     sequence.final_byte(),
+                    self.graphics.is_some(),
                 )
                 .map_err(|_| TerminalError::Unsupported("charset designation"));
         }
         match sequence.final_byte() {
+            b'6' | b'9' => {
+                let margins = self.margins;
+                let (left, right) = self.scrolling_horizontal_bounds();
+                self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                    screen.horizontal_index(
+                        sequence.final_byte() == b'9',
+                        margins.top,
+                        margins.bottom,
+                        left,
+                        right,
+                    );
+                    Ok(())
+                })?;
+            }
             b'7' => self.save_active_cursor(),
             b'8' => self.restore_active_cursor(),
-            b'D' => self.line_feed_active(),
+            b'D' => self.line_feed_active()?,
             b'E' => {
                 self.carriage_return_active();
-                self.line_feed_active();
+                self.line_feed_active()?;
             }
             b'H' => {
                 let column = self.active_screen().cursor_column;
                 let set = self.tabs.set_current(column);
                 debug_assert!(set);
             }
-            b'M' => self.reverse_index_active(),
+            b'M' => self.reverse_index_active()?,
             b'N' => self.charset.single_shift_2(),
             b'O' => self.charset.single_shift_3(),
             b'n' => self.charset.invoke_gl(GraphicRegister::G2),
@@ -1412,6 +2362,14 @@ impl Terminal {
         }
         if let Some(prefix) = csi.private_prefix() {
             return match prefix {
+                b'?' if csi.final_byte() == b'W' => {
+                    require_max_parameters(&csi, 1, "DECST8C parameters")?;
+                    if csi.parameter(0, 5) != 5 {
+                        return Err(TerminalError::Unsupported("DECST8C selector"));
+                    }
+                    self.tabs.hard_reset();
+                    Ok(())
+                }
                 b'?' if csi.final_byte() == b'm' => self.dispatch_xterm_modifier_query(&csi),
                 b'?' if csi.final_byte() == b'n' => self.dispatch_dec_device_status(&csi, effect),
                 b'?' if csi.final_byte() == b'u' => {
@@ -1420,7 +2378,14 @@ impl Terminal {
                 b'=' if csi.final_byte() == b'u' => self.dispatch_keyboard_protocol_set(&csi),
                 b'>' if csi.final_byte() == b'u' => self.dispatch_keyboard_protocol_push(&csi),
                 b'<' if csi.final_byte() == b'u' => self.dispatch_keyboard_protocol_pop(&csi),
-                b'?' => self.dispatch_private_mode(&csi),
+                b'=' if csi.final_byte() == b'c' => {
+                    if csi.parameters().len() <= 1 && csi.parameter(0, 0) == 0 {
+                        Self::emit_host_reply_v2(effect, b"\x1bP!|00000000\x1b\\")
+                    } else {
+                        Ok(())
+                    }
+                }
+                b'?' => self.dispatch_private_mode(&csi, effect),
                 b'>' => self.dispatch_xterm_private_csi(&csi, effect),
                 _ => Err(TerminalError::Unsupported("private CSI prefix")),
             };
@@ -1429,13 +2394,16 @@ impl Terminal {
             b'@' => {
                 let margins = self.margins;
                 let (left, right) = self.scrolling_horizontal_bounds();
-                self.active_screen_mut().insert_characters_in_rectangle(
-                    nonzero_parameter(&csi, 0),
-                    margins.top,
-                    margins.bottom,
-                    left,
-                    right,
-                );
+                self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                    screen.insert_characters_in_rectangle(
+                        nonzero_parameter(&csi, 0),
+                        margins.top,
+                        margins.bottom,
+                        left,
+                        right,
+                    );
+                    Ok(())
+                })?;
             }
             b'A' => self.move_cursor(-i64::from(nonzero_parameter(&csi, 0)), 0),
             b'B' | b'e' => self.move_cursor(i64::from(nonzero_parameter(&csi, 0)), 0),
@@ -1464,70 +2432,90 @@ impl Terminal {
             b'L' => {
                 let margins = self.margins;
                 let (left, right) = self.scrolling_horizontal_bounds();
-                self.active_screen_mut().insert_lines_in_rectangle(
-                    nonzero_parameter(&csi, 0),
-                    margins.top,
-                    margins.bottom,
-                    left,
-                    right,
-                );
+                self.with_graphics_motion(GraphicMotion::Observed, |screen| {
+                    screen.insert_lines_in_rectangle(
+                        nonzero_parameter(&csi, 0),
+                        margins.top,
+                        margins.bottom,
+                        left,
+                        right,
+                    );
+                    Ok(())
+                })?;
             }
             b'M' => {
                 let margins = self.margins;
                 let (left, right) = self.scrolling_horizontal_bounds();
-                self.active_screen_mut().delete_lines_in_rectangle(
-                    nonzero_parameter(&csi, 0),
-                    margins.top,
-                    margins.bottom,
-                    left,
-                    right,
-                );
+                self.with_graphics_motion(GraphicMotion::Observed, |screen| {
+                    screen.delete_lines_in_rectangle(
+                        nonzero_parameter(&csi, 0),
+                        margins.top,
+                        margins.bottom,
+                        left,
+                        right,
+                    );
+                    Ok(())
+                })?;
             }
             b'P' => {
                 let margins = self.margins;
                 let (left, right) = self.scrolling_horizontal_bounds();
-                self.active_screen_mut().delete_characters_in_rectangle(
-                    nonzero_parameter(&csi, 0),
-                    margins.top,
-                    margins.bottom,
-                    left,
-                    right,
-                );
+                self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                    screen.delete_characters_in_rectangle(
+                        nonzero_parameter(&csi, 0),
+                        margins.top,
+                        margins.bottom,
+                        left,
+                        right,
+                    );
+                    Ok(())
+                })?;
             }
             b'S' => {
                 let margins = self.margins;
                 let (left, right) = self.scrolling_horizontal_bounds();
                 let revision = self.next_source_sequence + 1;
-                self.active_screen_mut().scroll_up_rectangle_with_cause(
-                    nonzero_parameter(&csi, 0),
-                    margins.top,
-                    margins.bottom,
-                    left,
-                    right,
-                    ScrollCause::Output(revision),
-                );
+                self.with_graphics_motion(GraphicMotion::Observed, |screen| {
+                    screen.scroll_up_rectangle_with_cause(
+                        nonzero_parameter(&csi, 0),
+                        margins.top,
+                        margins.bottom,
+                        left,
+                        right,
+                        ScrollCause::Output(revision),
+                    );
+                    Ok(())
+                })?;
             }
             b'T' if csi.parameters().len() <= 1 => {
                 let margins = self.margins;
                 let (left, right) = self.scrolling_horizontal_bounds();
-                self.active_screen_mut().scroll_down_rectangle(
-                    nonzero_parameter(&csi, 0),
-                    margins.top,
-                    margins.bottom,
-                    left,
-                    right,
-                );
+                self.with_graphics_motion(GraphicMotion::Observed, |screen| {
+                    screen.scroll_down_rectangle(
+                        nonzero_parameter(&csi, 0),
+                        margins.top,
+                        margins.bottom,
+                        left,
+                        right,
+                    );
+                    Ok(())
+                })?;
+            }
+            b'U' | b'V' => {
+                require_max_parameters(&csi, 1, "page movement parameters")?;
+                let count = u32::from(nonzero_parameter(&csi, 0));
+                let active = u32::from(self.active_page());
+                self.move_page(if csi.final_byte() == b'U' {
+                    active.saturating_add(count)
+                } else {
+                    active.saturating_sub(count)
+                })?;
+                let row = self.absolute_row(1);
+                let column = self.absolute_column(1);
+                self.active_screen_mut().position_cursor(row, column);
             }
             b'X' => {
-                let margins = self.margins;
-                let (left, right) = self.scrolling_horizontal_bounds();
-                self.active_screen_mut().erase_characters_in_rectangle(
-                    nonzero_parameter(&csi, 0),
-                    margins.top,
-                    margins.bottom,
-                    left,
-                    right,
-                );
+                self.erase_characters_with_graphics(nonzero_parameter(&csi, 0))?;
             }
             b'Z' => {
                 let current = self.active_screen().cursor_column;
@@ -1544,6 +2532,8 @@ impl Terminal {
             b'c' if matches!(csi.parameters(), [] | [0] | [PARAM_MISSING]) => {
                 Self::emit_host_reply(effect, b"\x1b[?1;2c")?;
             }
+            b'c' => {} // Optional read-only DA selectors do not mutate terminal state.
+            b'x' => self.dispatch_terminal_parameters(&csi, effect)?,
             b'd' => {
                 let row = self.absolute_row(nonzero_parameter(&csi, 0));
                 let column = self.active_screen().cursor_column;
@@ -1564,16 +2554,14 @@ impl Terminal {
                 _ => return Err(TerminalError::Unsupported("tab clear mode")),
             },
             b'h' | b'l' => self.dispatch_ansi_mode(&csi)?,
-            b'J' => self
-                .active_screen_mut()
-                .erase_display(csi.parameter(0, 0))?,
-            b'K' => self.active_screen_mut().erase_line(csi.parameter(0, 0))?,
+            b'J' => self.erase_display_with_graphics(csi.parameter(0, 0))?,
+            b'K' => self.erase_line_with_graphics(csi.parameter(0, 0))?,
             b'm' => self.apply_sgr(&csi)?,
             b'n' => self.dispatch_device_status(&csi, effect)?,
             b'r' => self.set_vertical_margins(&csi)?,
             b's' if self.modes.left_right_margin => self.set_horizontal_margins(&csi)?,
             b's' if csi.parameters().is_empty() => self.save_active_cursor(),
-            b't' => self.dispatch_window_manipulation(&csi)?,
+            b't' => self.dispatch_window_manipulation(&csi, effect)?,
             b'u' if csi.parameters().is_empty() => self.restore_active_cursor(),
             _ => return Err(TerminalError::Unsupported("CSI command")),
         }
@@ -1665,6 +2653,7 @@ impl Terminal {
             b'q' if matches!(csi.parameters(), [] | [0] | [PARAM_MISSING]) => {
                 Self::emit_host_reply_v2(effect, b"\x1bP>|TermLink(1)\x1b\\")
             }
+            b'c' | b'q' => Ok(()),
             _ => Err(TerminalError::Unsupported("private CSI prefix")),
         }
     }
@@ -1688,7 +2677,7 @@ impl Terminal {
         match csi.parameters() {
             [5] => Self::emit_host_reply(effect, b"\x1b[0n"),
             [6] => self.emit_cursor_position_report(effect, false),
-            _ => Err(TerminalError::Unsupported("device status report")),
+            _ => Ok(()), // Unsupported read-only selectors have no reply or state change.
         }
     }
 
@@ -1700,7 +2689,28 @@ impl Terminal {
         match csi.parameters() {
             [5] => Self::emit_host_reply(effect, b"\x1b[?0n"),
             [6] => self.emit_cursor_position_report(effect, true),
-            _ => Err(TerminalError::Unsupported("DEC device status report")),
+            [15] => Self::emit_host_reply_v2(effect, b"\x1b[?13n"),
+            [25] => Self::emit_host_reply_v2(effect, b"\x1b[?23n"),
+            [26] => Self::emit_host_reply_v2(effect, b"\x1b[?27;0;0;5n"),
+            [53] | [55] => Self::emit_host_reply_v2(effect, b"\x1b[?53n"),
+            [56] => Self::emit_host_reply_v2(effect, b"\x1b[?57;0n"),
+            [62] => Self::emit_host_reply_v2(
+                effect,
+                format!("\x1b[{}*{{", (macros::MAX_BYTES - self.macros.used()) / 16).as_bytes(),
+            ),
+            [63] | [63, _] => Self::emit_host_reply_v2(
+                effect,
+                format!(
+                    "\x1bP{}!~{:04X}\x1b\\",
+                    csi.parameter(1, 0),
+                    self.macros.checksum()
+                )
+                .as_bytes(),
+            ),
+            [75] => Self::emit_host_reply_v2(effect, b"\x1b[?70n"),
+            [85] => Self::emit_host_reply_v2(effect, b"\x1b[?83n"),
+            [996] => self.report_theme(effect),
+            _ => Ok(()),
         }
     }
 
@@ -1714,6 +2724,12 @@ impl Terminal {
         let row = screen.cursor_row.clamp(top, bottom - 1) - top + 1;
         let (left, right) = self.horizontal_cursor_bounds();
         let column = screen.cursor_column.clamp(left, right - 1) - left + 1;
+        if dec_private && self.pages.has_state() {
+            return Self::emit_host_reply_v2(
+                effect,
+                format!("\x1b[?{row};{column};{}R", self.active_page()).as_bytes(),
+            );
+        }
         let mut reply = [0_u8; 32];
         reply[..2].copy_from_slice(b"\x1b[");
         let mut len = 2;
@@ -1735,11 +2751,16 @@ impl Terminal {
         payload: &[u8],
     ) -> Result<(), TerminalError> {
         if let Some(effect) = effect {
+            let encoded = if effect.send_c1 {
+                Some(traditional::encode_c1(payload)?)
+            } else {
+                None
+            };
             effect.capture.push_reply(
                 effect.source_sequence,
                 effect.source_offset_end,
-                payload,
-                false,
+                encoded.as_deref().unwrap_or(payload),
+                effect.send_c1,
             )?;
         }
         Ok(())
@@ -1750,10 +2771,15 @@ impl Terminal {
         payload: &[u8],
     ) -> Result<(), TerminalError> {
         if let Some(effect) = effect {
+            let encoded = if effect.send_c1 {
+                Some(traditional::encode_c1(payload)?)
+            } else {
+                None
+            };
             effect.capture.push_reply(
                 effect.source_sequence,
                 effect.source_offset_end,
-                payload,
+                encoded.as_deref().unwrap_or(payload),
                 true,
             )?;
         }
@@ -1765,10 +2791,15 @@ impl Terminal {
         payload: &[u8],
     ) -> Result<(), TerminalError> {
         if let Some(effect) = effect {
+            let encoded = if effect.send_c1 {
+                Some(traditional::encode_c1(payload)?)
+            } else {
+                None
+            };
             effect.capture.push_reply(
                 effect.source_sequence,
                 effect.source_offset_end,
-                payload,
+                encoded.as_deref().unwrap_or(payload),
                 true,
             )?;
         }
@@ -1787,6 +2818,85 @@ impl Terminal {
             return Err(TerminalError::Unsupported("private intermediate CSI"));
         }
         match (csi.intermediates(), csi.final_byte()) {
+            (b",", b'~') => return host_signals::sound(csi, effect),
+            (b"$" | b"*", b'|') => {
+                require_max_parameters(csi, 1, "page size parameters")?;
+                let columns_requested = csi.intermediates() == b"$";
+                let default = if columns_requested { 80 } else { 24 };
+                let value = match csi.parameter(0, default) {
+                    0 => default,
+                    value => value,
+                };
+                if value > 512 {
+                    self.diagnostics.trace.reject_parameter(0);
+                    return Err(TerminalError::Unsupported("page size exceeds 512 cells"));
+                }
+                // Only a later ordered Resize, after the host has changed its PTY,
+                // may alter geometry. Replay and mirrors never perform host actions.
+                if let Some(effect) = effect {
+                    effect.capture.push_resize(
+                        effect.source_sequence,
+                        effect.source_offset_end,
+                        if columns_requested { value } else { 0 },
+                        if columns_requested { 0 } else { value },
+                    )?;
+                }
+            }
+            (b"*", b'z') => return self.invoke_macro(csi, effect),
+            (b",", b'|') => {
+                require_max_parameters(csi, 3, "DECAC parameters")?;
+                for (index, limit, reason) in [
+                    (0, 2, "DECAC item"),
+                    (1, 257, "DECAC foreground color index"),
+                    (2, 257, "DECAC background color index"),
+                ] {
+                    if csi.parameter(index, 0) > limit {
+                        self.diagnostics.trace.reject_parameter(index);
+                        return Err(TerminalError::Unsupported(reason));
+                    }
+                }
+                self.osc
+                    .assign_colors(
+                        csi.parameter(0, 1).max(1),
+                        csi.parameter(1, 0),
+                        csi.parameter(2, 0),
+                    )
+                    .map_err(map_osc_error)?;
+            }
+            (b"&", b'u') => {
+                require_max_parameters(csi, 1, "DECRQUPSS parameters")?;
+                if csi.parameter(0, 0) == 0 {
+                    self.report_user_preference(effect)?;
+                }
+            }
+            (b"$", b'u') => self.report_terminal_state(csi, effect)?,
+            (b"$", b'w') => self.report_presentation_state(csi, effect)?,
+            (b"#", b'{' | b'p') => self.push_rendition(csi),
+            (b"#", b'}' | b'q') => self.pop_rendition(csi)?,
+            (b" ", b'P' | b'Q' | b'R') => {
+                require_max_parameters(csi, 1, "page movement parameters")?;
+                let count = u32::from(nonzero_parameter(csi, 0));
+                let active = u32::from(self.active_page());
+                let page = match csi.final_byte() {
+                    b'P' => count,
+                    b'Q' => active.saturating_add(count),
+                    _ => active.saturating_sub(count),
+                };
+                self.move_page(page)?;
+            }
+            (b"\"", b'v') => {
+                if csi.parameters().is_empty() {
+                    let reply = format!(
+                        "\x1b[{};{};1;1;{}\"w",
+                        self.rows,
+                        self.columns,
+                        self.visible_page()
+                    );
+                    Self::emit_host_reply_v2(effect, reply.as_bytes())?;
+                }
+            }
+            (b"*", b'y') => self.dispatch_rectangle_checksum(csi, effect)?,
+            (b"!", b'p') if csi.parameters().is_empty() => self.soft_reset_model(),
             (b" ", b'q') => {
                 self.set_cursor_style(csi)?;
             }
@@ -1794,25 +2904,31 @@ impl Terminal {
                 require_max_parameters(csi, 1, "DECIC parameters")?;
                 let margins = self.margins;
                 let (left, right) = self.scrolling_horizontal_bounds();
-                self.active_screen_mut().insert_columns_in_rectangle(
-                    nonzero_parameter(csi, 0),
-                    margins.top,
-                    margins.bottom,
-                    left,
-                    right,
-                );
+                self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                    screen.insert_columns_in_rectangle(
+                        nonzero_parameter(csi, 0),
+                        margins.top,
+                        margins.bottom,
+                        left,
+                        right,
+                    );
+                    Ok(())
+                })?;
             }
             (b"'", b'~') => {
                 require_max_parameters(csi, 1, "DECDC parameters")?;
                 let margins = self.margins;
                 let (left, right) = self.scrolling_horizontal_bounds();
-                self.active_screen_mut().delete_columns_in_rectangle(
-                    nonzero_parameter(csi, 0),
-                    margins.top,
-                    margins.bottom,
-                    left,
-                    right,
-                );
+                self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                    screen.delete_columns_in_rectangle(
+                        nonzero_parameter(csi, 0),
+                        margins.top,
+                        margins.bottom,
+                        left,
+                        right,
+                    );
+                    Ok(())
+                })?;
             }
             // Vim emits this legacy character-encoding selection marker on
             // ConPTY startup. TermLink's output contract is always UTF-8, so
@@ -1823,58 +2939,54 @@ impl Terminal {
             (b"$", b'z') => {
                 require_max_parameters(csi, 4, "DECERA parameters")?;
                 if let Some((top, left, bottom, right)) = self.rectangle_coordinates(csi, 0) {
-                    self.active_screen_mut()
-                        .erase_rectangle(top, left, bottom, right);
+                    self.with_graphics_motion(
+                        GraphicMotion::EraseSixel {
+                            top,
+                            left,
+                            bottom,
+                            right,
+                        },
+                        |screen| {
+                            screen.erase_rectangle(top, left, bottom, right);
+                            Ok(())
+                        },
+                    )?;
                 }
             }
             (b"$", b'{') => {
                 require_max_parameters(csi, 4, "DECSERA parameters")?;
                 if let Some((top, left, bottom, right)) = self.rectangle_coordinates(csi, 0) {
-                    self.active_screen_mut()
-                        .selective_erase_rectangle(top, left, bottom, right)?;
+                    self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                        screen.selective_erase_rectangle(top, left, bottom, right)
+                    })?;
                 }
             }
             (b"$", b'x') => {
                 require_max_parameters(csi, 5, "DECFRA parameters")?;
                 let pch = csi.parameters().first().copied().unwrap_or(PARAM_MISSING);
-                let character = match self
-                    .charset
-                    .decode_rectangle_fill_with_national_replacement(
-                        u32::from(pch),
-                        self.modes.national_replacement_character_set_mode,
-                    ) {
+                let mapped = match self.charset.rectangle_fill_metadata(
+                    u32::from(pch),
+                    self.modes.national_replacement_character_set_mode,
+                    self.user_preferred_charset,
+                ) {
                     Ok(character) => character,
                     Err(RectangleFillError::InvalidPch(_)) => return Ok(()),
                     Err(RectangleFillError::Unsupported(_)) => {
                         return Err(TerminalError::Unsupported("DECFRA character set"));
                     }
                 };
+                let (character, glyph) = self.resolve_graphic(mapped);
                 if let Some((top, left, bottom, right)) = self.rectangle_coordinates(csi, 1) {
                     let hyperlink = self.osc.current_hyperlink();
-                    self.active_screen_mut().fill_rectangle_with_hyperlink(
-                        character, top, left, bottom, right, hyperlink,
-                    )?;
+                    self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+                        screen.fill_rectangle_with_glyph(
+                            character, glyph, top, left, bottom, right, hyperlink,
+                        )
+                    })?;
                 }
             }
             (b"$", b'v') => {
-                require_max_parameters(csi, 8, "DECCRA parameters")?;
-                let source_page = dec_parameter(csi, 4, 1);
-                let destination_page = dec_parameter(csi, 7, 1);
-                if source_page != 1 || destination_page != 1 {
-                    return Err(TerminalError::Unsupported("DECCRA page"));
-                }
-                if let Some((top, left, bottom, right)) = self.rectangle_coordinates(csi, 0) {
-                    let (destination_top, destination_left) =
-                        self.rectangle_origin_coordinates(csi, 5);
-                    self.active_screen_mut().copy_rectangle(
-                        top,
-                        left,
-                        bottom,
-                        right,
-                        destination_top,
-                        destination_left,
-                    );
-                }
+                self.copy_page_rectangle(csi)?;
             }
             (b"$", b'r') => self.change_rectangle_rendition(csi, false)?,
             (b"$", b't') => self.change_rectangle_rendition(csi, true)?,
@@ -1915,10 +3027,22 @@ impl Terminal {
         };
         let setting = if private {
             match parameter {
+                2 => Some(!self.modes.vt52),
                 25 => Some(self.cursor_visible),
                 47 | 1047 | 1049 => Some(self.active_alternate),
+                64 => Some(self.pages.coupled),
+                80 => self
+                    .graphics
+                    .as_ref()
+                    .map(|graphics| graphics.sixel_scrolling()),
                 2026 => Some(self.synchronized_output_deadline_micros.is_some()),
-                1048 => None,
+                // Keep legacy mode bits snapshot-compatible, but do not advertise
+                // full grapheme segmentation or theme reports we cannot produce.
+                2027 if self.width_profile() == WidthProfile::Unicode16 => {
+                    Some(self.modes.grapheme_clustering)
+                }
+                2031 if self.osc.theme_scheme() != 0 => Some(self.modes.color_scheme_reporting),
+                1048 | 2027 | 2031 => None,
                 _ => self.modes.query_private_mode(parameter),
             }
         } else if parameter == 25 {
@@ -2011,37 +3135,47 @@ impl Terminal {
         if csi.parameters().len() <= 4 {
             return Ok(());
         }
-        let operations = parse_sgr_operations(csi, 4)?;
+        let operations = parse_sgr_operations(csi, 4, &mut self.diagnostics.trace)?;
         let Some((top, left, bottom, right)) = self.rectangle_coordinates(csi, 0) else {
             return Ok(());
         };
         let rectangle_extent =
             self.modes.attribute_change_extent == AttributeChangeExtent::Rectangle;
-        if reverse {
-            self.active_screen_mut()
-                .transform_rectangle_attributes_with_extent(
+        let retain_graphics_padding = self.graphics.is_some();
+        self.with_graphics_motion(GraphicMotion::Preserve, |screen| {
+            screen.transform_rectangle_attributes_with_extent(
+                top,
+                left,
+                bottom,
+                right,
+                rectangle_extent,
+                |attributes| {
+                    if reverse {
+                        apply_reverse_sgr_operations(attributes, &operations)
+                    } else {
+                        apply_sgr_operations(attributes, &operations)
+                    }
+                },
+            );
+            if retain_graphics_padding {
+                screen.retain_rectangle_rendition_padding(
                     top,
                     left,
                     bottom,
                     right,
                     rectangle_extent,
-                    |attributes| apply_reverse_sgr_operations(attributes, &operations),
                 );
-        } else {
-            self.active_screen_mut()
-                .transform_rectangle_attributes_with_extent(
-                    top,
-                    left,
-                    bottom,
-                    right,
-                    rectangle_extent,
-                    |attributes| apply_sgr_operations(attributes, &operations),
-                );
-        }
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
-    fn dispatch_private_mode(&mut self, csi: &CsiSequence) -> Result<(), TerminalError> {
+    fn dispatch_private_mode(
+        &mut self,
+        csi: &CsiSequence,
+        mut effect: Option<EffectContext<'_>>,
+    ) -> Result<(), TerminalError> {
         let enabled = match csi.final_byte() {
             b'h' => true,
             b'l' => false,
@@ -2050,24 +3184,36 @@ impl Terminal {
         if csi.parameters().is_empty() {
             return Err(TerminalError::Unsupported("empty private mode"));
         }
-        for &parameter in csi.parameters() {
+        for (index, &parameter) in csi.parameters().iter().enumerate() {
             match parameter {
+                2 => self.set_ansi_mode(enabled),
+                2031 => {
+                    let changed = self.modes.color_scheme_reporting != enabled;
+                    self.modes.color_scheme_reporting = enabled;
+                    if changed && enabled {
+                        self.report_theme(effect.as_mut().map(EffectContext::reborrow))?;
+                    }
+                }
                 25 => self.cursor_visible = enabled,
+                80 if self.graphics.is_some() => {
+                    self.graphics.as_mut().unwrap().set_sixel_scrolling(enabled)
+                }
                 2026 if enabled => {
                     self.synchronized_output_deadline_micros =
                         Some(self.logical_time_micros.saturating_add(1_000_000));
                 }
                 2026 => self.synchronized_output_deadline_micros = None,
                 47 => self.set_alternate_buffer(enabled)?,
+                64 => {
+                    self.pages.coupled = enabled;
+                    if enabled {
+                        self.pages.visible = self.pages.active;
+                    }
+                }
                 1047 => self.set_alternate_buffer_and_clear_on_exit(enabled)?,
                 1048 if enabled => self.save_active_cursor(),
                 1048 => self.restore_active_cursor(),
                 1049 => self.set_saved_alternate_buffer(enabled)?,
-                // Alternate-scroll is a frontend wheel-to-key policy, not a grid
-                // mutation. We do not implement that policy: consume this hint
-                // (as pinned Termux does) without changing input or snapshots.
-                // DECRQM still reports it as unrecognized, not falsely enabled.
-                1007 => {}
                 69 => {
                     let changed = self.modes.set_private_mode(parameter, enabled);
                     debug_assert!(changed);
@@ -2081,7 +3227,10 @@ impl Terminal {
                         self.active_screen_mut().cancel_pending_wrap();
                     }
                 }
-                _ => return Err(TerminalError::Unsupported("private mode")),
+                _ => {
+                    self.diagnostics.trace.reject_parameter(index);
+                    return Err(TerminalError::Unsupported("private mode"));
+                }
             }
         }
         Ok(())
@@ -2092,35 +3241,40 @@ impl Terminal {
         if csi.parameters().is_empty() {
             return Err(TerminalError::Unsupported("empty ANSI mode"));
         }
-        for &parameter in csi.parameters() {
+        for (index, &parameter) in csi.parameters().iter().enumerate() {
             match parameter {
                 // ConPTY emits the non-private form while synchronizing legacy
                 // console cursor visibility. Treat it as the DECTCEM alias
                 // used by the same captured stream rather than poisoning the
                 // deterministic mirror.
                 25 => self.cursor_visible = enabled,
-                PARAM_MISSING => return Err(TerminalError::Unsupported("ANSI mode")),
+                PARAM_MISSING => {
+                    self.diagnostics.trace.reject_parameter(index);
+                    return Err(TerminalError::Unsupported("ANSI mode"));
+                }
                 _ if self.modes.set_ansi_mode(parameter, enabled) => {}
-                _ => return Err(TerminalError::Unsupported("ANSI mode")),
+                _ => {
+                    self.diagnostics.trace.reject_parameter(index);
+                    return Err(TerminalError::Unsupported("ANSI mode"));
+                }
             }
         }
         Ok(())
     }
 
-    fn dispatch_window_manipulation(&mut self, csi: &CsiSequence) -> Result<(), TerminalError> {
+    fn dispatch_window_manipulation(
+        &mut self,
+        csi: &CsiSequence,
+        effect: Option<EffectContext<'_>>,
+    ) -> Result<(), TerminalError> {
+        if matches!(csi.parameter(0, 0), 14..=16 | 18 | 19) {
+            return self.report_geometry(csi, effect);
+        }
         require_max_parameters(csi, 3, "window manipulation parameters")?;
         // Modern OpenConsole begins its VT stream with the window-restore hint.
         // Window visibility belongs to the outer UI; it has no durable cell state
         // or reply. Recognize only this exact operation, not arbitrary window ops.
         if csi.parameters() == [1] {
-            return Ok(());
-        }
-        // XTVERSION-capable TUIs commonly probe `CSI 14 t` for the text-area
-        // pixel dimensions. TermLink's durable cross-device model owns cell
-        // dimensions only; pixel geometry belongs to each renderer and is not
-        // carried by an output event. Recognize the exact query without
-        // fabricating a reply so the application can use its bounded fallback.
-        if csi.parameters() == [14] {
             return Ok(());
         }
         let save = match csi.parameter(0, 0) {
@@ -2160,9 +3314,32 @@ impl Terminal {
         sequence: &OscSequence,
         mut effect: Option<EffectContext<'_>>,
     ) -> Result<(), TerminalError> {
+        if sequence.selector() == 9 {
+            return self.host_signals.apply_progress(sequence.payload());
+        }
+        if sequence.selector() == 52 {
+            return clipboard::write(sequence.payload(), effect);
+        }
+        if matches!(sequence.selector(), 7 | 133) {
+            return self.apply_shell_annotation(u32::from(sequence.selector()), sequence.payload());
+        }
+        // DOCS selects ISO-8859-1 for control-string text. G-set translation
+        // applies only to screen glyphs, never titles or hyperlink metadata.
+        let decoded = if self.modes.iso2022 && matches!(sequence.selector(), 0 | 1 | 2 | 8 | 21) {
+            let mut text = String::new();
+            text.try_reserve(sequence.payload().len() * 2)
+                .map_err(|_| TerminalError::LimitExceeded)?;
+            text.extend(sequence.payload().iter().copied().map(char::from));
+            Some(text)
+        } else {
+            None
+        };
         let (_, queries) = self
             .osc
-            .apply_with_color_queries(sequence.selector(), sequence.payload())
+            .apply_with_color_queries(
+                sequence.selector(),
+                decoded.as_deref().map_or(sequence.payload(), str::as_bytes),
+            )
             .map_err(map_osc_error)?;
         for query in queries {
             let reply = match query {
@@ -2190,9 +3367,55 @@ impl Terminal {
     ) -> Result<(), TerminalError> {
         debug_assert_eq!(sequence.private_prefix(), None);
         debug_assert!(!sequence.has_subparameters());
+        if self.graphics.is_some()
+            && sequence.intermediates().is_empty()
+            && sequence.final_byte() == b'{'
+        {
+            let download = drcs::decode(sequence.parameters(), sequence.payload())?;
+            let cell_resources = self.cell_graphic_resources();
+            if let Some(graphics) = &mut self.graphics {
+                graphics.install_font(download, &cell_resources)?;
+            }
+            return Ok(());
+        }
+        if self.graphics.is_some()
+            && sequence.intermediates().is_empty()
+            && sequence.final_byte() == b'q'
+        {
+            return self.dispatch_sixel(&sequence);
+        }
+        if sequence.intermediates() == b"!" && sequence.final_byte() == b'z' {
+            return self.define_macro(&sequence);
+        }
+        if sequence.intermediates() == b"!" && sequence.final_byte() == b'u' {
+            return self.assign_user_preference(&sequence);
+        }
+        if sequence.intermediates() == b"$" && matches!(sequence.final_byte(), b'p' | b't') {
+            return self.restore_report(&sequence);
+        }
         if sequence.intermediates() == b"$" && sequence.final_byte() == b'q' {
             if !sequence.parameters().is_empty() {
                 return Err(TerminalError::Unsupported("DCS query parameters"));
+            }
+            if let Some(item) = sequence.payload().strip_suffix(b",|") {
+                let item = match item {
+                    b"" | b"0" | b"1" => 1,
+                    b"2" => 2,
+                    _ => 0,
+                };
+                let reply = if item == 0 {
+                    "\x1bP0$r\x1b\\".to_string()
+                } else {
+                    let aliases = self.osc.color_aliases();
+                    let offset = (item - 1) * 2;
+                    format!(
+                        "\x1bP1$r{};{};{},|\x1b\\",
+                        item,
+                        aliases[offset].unwrap_or(256),
+                        aliases[offset + 1].unwrap_or(257)
+                    )
+                };
+                return Self::emit_host_reply_v2(effect, reply.as_bytes());
             }
             let screen = self.active_screen();
             let state = query_reply::DecrqssState::new(
@@ -2236,18 +3459,20 @@ impl Terminal {
         Err(TerminalError::Unsupported(feature))
     }
 
-    fn line_feed_active(&mut self) {
+    fn line_feed_active(&mut self) -> Result<(), TerminalError> {
         let margins = self.margins;
         let (left, right) = self.scrolling_horizontal_bounds();
         let revision = self.next_source_sequence + 1;
-        self.active_screen_mut()
-            .line_feed_in_rectangle_with_scroll_cause(
+        self.with_graphics_motion(GraphicMotion::Observed, |screen| {
+            screen.line_feed_in_rectangle_with_scroll_cause(
                 margins.top,
                 margins.bottom,
                 left,
                 right,
                 ScrollCause::Output(revision),
             );
+            Ok(())
+        })
     }
 
     fn scrolling_horizontal_bounds(&self) -> (u32, u32) {
@@ -2272,15 +3497,13 @@ impl Terminal {
         self.active_screen_mut().position_cursor(row, target);
     }
 
-    fn reverse_index_active(&mut self) {
+    fn reverse_index_active(&mut self) -> Result<(), TerminalError> {
         let margins = self.margins;
         let (left, right) = self.scrolling_horizontal_bounds();
-        self.active_screen_mut().reverse_index_in_rectangle(
-            margins.top,
-            margins.bottom,
-            left,
-            right,
-        );
+        self.with_graphics_motion(GraphicMotion::Observed, |screen| {
+            screen.reverse_index_in_rectangle(margins.top, margins.bottom, left, right);
+            Ok(())
+        })
     }
 
     fn save_active_cursor(&mut self) {
@@ -2291,10 +3514,17 @@ impl Terminal {
             self.alternate_saved_charset = self.charset;
         } else {
             self.main_saved_charset = self.charset;
+            self.pages.saved = self.pages.active;
         }
     }
 
     fn restore_active_cursor(&mut self) {
+        if !self.active_alternate {
+            self.pages.active = self.pages.saved;
+            if self.pages.coupled {
+                self.pages.visible = self.pages.active;
+            }
+        }
         let (origin_mode, auto_wrap) = self.active_screen_mut().restore_cursor();
         self.modes.origin_mode = origin_mode;
         self.modes.auto_wrap = auto_wrap;
@@ -2308,9 +3538,12 @@ impl Terminal {
 
     fn expected_wrap_column(&self, row: u32) -> u32 {
         if self.modes.left_right_margin && row >= self.margins.top && row < self.margins.bottom {
-            self.margins.right - 1
+            self.margins
+                .right
+                .min(self.active_screen().line_columns(row))
+                - 1
         } else {
-            self.columns - 1
+            self.active_screen().line_columns(row) - 1
         }
     }
 
@@ -2468,7 +3701,7 @@ impl Terminal {
     }
 
     fn apply_sgr(&mut self, csi: &CsiSequence) -> Result<(), TerminalError> {
-        let operations = parse_sgr_operations(csi, 0)?;
+        let operations = parse_sgr_operations(csi, 0, &mut self.diagnostics.trace)?;
         let mut attributes = self.active_screen().attributes;
         apply_sgr_operations(&mut attributes, &operations);
         self.active_screen_mut().attributes = attributes;
@@ -2491,8 +3724,12 @@ impl Terminal {
         if self.active_alternate {
             return;
         }
-        let wrap_column = self.expected_wrap_column(self.main.cursor_row);
-        Self::copy_cursor_presentation(&self.main, &mut self.alternate, wrap_column);
+        let wrap_column = self.expected_wrap_column(self.active_screen().cursor_row);
+        Self::copy_cursor_presentation(
+            self.pages.screen(&self.main, self.pages.active),
+            &mut self.alternate,
+            wrap_column,
+        );
         self.active_alternate = true;
         self.revalidate_active_wrap_pending();
     }
@@ -2502,14 +3739,22 @@ impl Terminal {
             return Ok(());
         }
         if self.main.columns != self.columns || self.main.rows != self.rows {
-            if self.modes.left_right_margin {
-                self.main.resize_crop(self.columns, self.rows);
-            } else {
-                self.main.resize_reflow(self.columns, self.rows)?;
-            }
+            let (columns, rows, crop) = (self.columns, self.rows, self.modes.left_right_margin);
+            self.with_page_graphics_motion(1, GraphicMotion::Reflow, |screen| {
+                if crop {
+                    screen.resize_crop(columns, rows);
+                    Ok(())
+                } else {
+                    screen.resize_reflow(columns, rows)
+                }
+            })?;
         }
         let wrap_column = self.expected_wrap_column(self.alternate.cursor_row);
-        Self::copy_cursor_presentation(&self.alternate, &mut self.main, wrap_column);
+        Self::copy_cursor_presentation(
+            &self.alternate,
+            self.pages.screen_mut(&mut self.main, self.pages.active),
+            wrap_column,
+        );
         self.active_alternate = false;
         self.revalidate_active_wrap_pending();
         Ok(())
@@ -2517,6 +3762,12 @@ impl Terminal {
 
     fn clear_alternate(&mut self) {
         self.alternate.reset();
+        let cell_resources = self.cell_graphic_resources();
+        if let Some(graphics) = &mut self.graphics {
+            graphics
+                .retain_placements(|p| p.anchor.page != 7, &cell_resources)
+                .expect("committed cells have valid graphic references");
+        }
         self.alternate_saved_charset = CharsetState::default();
     }
 
@@ -2546,8 +3797,8 @@ impl Terminal {
 
     fn set_saved_alternate_buffer(&mut self, enabled: bool) -> Result<(), TerminalError> {
         if enabled && !self.active_alternate {
-            let attributes = self.main.attributes;
-            let protected = self.main.protected;
+            let attributes = self.active_screen().attributes;
+            let protected = self.active_screen().protected;
             self.save_active_cursor();
             self.clear_alternate();
             self.alternate.attributes = attributes;
@@ -2561,8 +3812,36 @@ impl Terminal {
         Ok(())
     }
 
+    fn soft_reset_model(&mut self) {
+        // DECSTR resets the active cursor's presentation, not its position,
+        // cells, history, tabs, alternate-screen selection or host input modes.
+        self.cursor_visible = true;
+        self.modes.insert_mode = false;
+        self.modes.origin_mode = false;
+        self.modes.auto_wrap = true;
+        self.modes.cursor_keys_application = false;
+        self.modes.keypad_application = false;
+        self.modes.left_right_margin = false;
+        self.pages.coupled = true;
+        self.pages.visible = self.pages.active;
+        self.margins = Margins::full(self.columns, self.rows);
+        self.charset.hard_reset();
+        if self.active_alternate {
+            self.alternate_saved_charset = self.charset;
+        } else {
+            self.main_saved_charset = self.charset;
+            self.pages.saved = self.pages.active;
+        }
+        let screen = self.active_screen_mut();
+        screen.attributes = Attributes::default();
+        screen.set_protected(false);
+        screen.saved = screen::SavedCursor::default();
+        screen.cancel_pending_wrap();
+    }
+
     fn hard_reset_model(&mut self) {
         let history_capacity_rows = self.main.requested_history_rows();
+        let width_profile = self.width_profile();
         self.main = Screen::new_with_history_capacity(
             self.columns,
             self.rows,
@@ -2570,11 +3849,16 @@ impl Terminal {
             MAX_CELLS,
         );
         self.alternate = Screen::new(self.columns, self.rows);
+        self.pages = pages::PageStore::default();
+        self.main.width_profile = width_profile;
+        self.alternate.width_profile = width_profile;
         self.active_alternate = false;
         self.cursor_visible = true;
         self.cursor_shape = CursorShape::Block;
         self.cursor_blinking = true;
         self.modes.hard_reset();
+        self.user_preferred_charset = charset::CharsetDesignation::LATIN1;
+        self.modes.grapheme_clustering = width_profile == WidthProfile::Unicode16;
         self.main_keyboard_protocol = KeyboardProtocolStack::default();
         self.alternate_keyboard_protocol = KeyboardProtocolStack::default();
         self.margins = Margins::full(self.columns, self.rows);
@@ -2582,12 +3866,25 @@ impl Terminal {
         self.charset.hard_reset();
         self.main_saved_charset = CharsetState::default();
         self.alternate_saved_charset = CharsetState::default();
-        self.osc = OscState::new(*self.osc.baseline());
+        self.osc.reset_to_host_baseline();
         self.synchronized_output_deadline_micros = None;
         self.parser = ParserState::Ground;
         self.utf8.clear();
         self.string_utf8.clear();
         self.repeat_source = None;
+        self.sgr_stack = sgr_stack::SgrStack::default();
+        self.macros = macros::MacroStore::default();
+        self.shell_integration.reset();
+        self.host_signals = HostSignalsV1::default();
+        if let Some(graphics) = &mut self.graphics {
+            graphics
+                .reset(&[])
+                .expect("empty graphics references cannot fail collection");
+        }
+        self.kitty_transfer.abort();
+        if self.macro_execution.depth != 0 {
+            self.macro_execution.cancelled = true;
+        }
     }
 }
 
@@ -2620,6 +3917,7 @@ enum SgrOperation {
 fn parse_sgr_operations(
     csi: &CsiSequence,
     start: usize,
+    trace: &mut diagnostic::SequenceTrace,
 ) -> Result<Vec<SgrOperation>, TerminalError> {
     let parameters = csi.parameters();
     let separators = csi.parameter_separators();
@@ -2639,7 +3937,14 @@ fn parse_sgr_operations(
             group_end += 1;
         }
         if group_end != index {
-            operations.push(parse_colon_sgr_operation(&parameters[index..=group_end])?);
+            operations.push(
+                parse_colon_sgr_operation(&parameters[index..=group_end]).map_err(
+                    |(error, offset)| {
+                        trace.reject_parameter(index + offset);
+                        error
+                    },
+                )?,
+            );
             index = group_end + 1;
             continue;
         }
@@ -2681,7 +3986,11 @@ fn parse_sgr_operations(
                 Color::Indexed(u8::try_from(parameter - 30).expect("basic foreground")),
             ),
             38 | 48 | 58 => {
-                let (color, end) = parse_semicolon_extended_color(csi, index)?;
+                let (color, end) =
+                    parse_semicolon_extended_color(csi, index).map_err(|(error, index)| {
+                        trace.reject_parameter(index);
+                        error
+                    })?;
                 index = end;
                 SgrOperation::Color(color_target(parameter), color)
             }
@@ -2702,7 +4011,10 @@ fn parse_sgr_operations(
                 ColorTarget::Background,
                 Color::Indexed(u8::try_from(parameter - 100 + 8).expect("bright background")),
             ),
-            _ => return Err(TerminalError::Unsupported("SGR parameter")),
+            _ => {
+                trace.reject_parameter(index);
+                return Err(TerminalError::Unsupported("SGR parameter"));
+            }
         };
         operations.push(operation);
         index += 1;
@@ -2710,7 +4022,7 @@ fn parse_sgr_operations(
     Ok(operations)
 }
 
-fn parse_colon_sgr_operation(group: &[u16]) -> Result<SgrOperation, TerminalError> {
+fn parse_colon_sgr_operation(group: &[u16]) -> Result<SgrOperation, (TerminalError, usize)> {
     match group {
         [4, value @ 0..=5] => {
             let style = underline_style(*value);
@@ -2723,7 +4035,9 @@ fn parse_colon_sgr_operation(group: &[u16]) -> Result<SgrOperation, TerminalErro
             color_target(*selector),
             parse_colon_extended_color(group)?,
         )),
-        _ => Err(TerminalError::Unsupported("SGR colon group")),
+        [4, value, ..] if *value > 5 => Err((TerminalError::Unsupported("SGR underline style"), 1)),
+        [4, _, _, ..] => Err((TerminalError::Unsupported("SGR underline group length"), 2)),
+        _ => Err((TerminalError::Unsupported("SGR colon group"), 0)),
     }
 }
 
@@ -2823,30 +4137,31 @@ fn toggle_underline(attributes: &mut Attributes, target: UnderlineStyle) {
 fn parse_semicolon_extended_color(
     csi: &CsiSequence,
     index: usize,
-) -> Result<(Color, usize), TerminalError> {
+) -> Result<(Color, usize), (TerminalError, usize)> {
     let parameters = csi.parameters();
-    let mode = parameters
-        .get(index + 1)
-        .copied()
-        .ok_or(TerminalError::Unsupported("incomplete extended color"))?;
+    let mode = parameters.get(index + 1).copied().ok_or((
+        TerminalError::Unsupported("incomplete extended color"),
+        index + 1,
+    ))?;
     let end = match mode {
         5 => index + 2,
         2 => index + 4,
-        _ => return Err(TerminalError::Unsupported("extended color mode")),
+        _ => return Err((TerminalError::Unsupported("extended color mode"), index + 1)),
     };
-    if parameters.get(end).is_none()
-        || csi.parameter_separators().get(end) == Some(&ParameterSeparator::Colon)
-        || !csi
-            .parameter_separators()
-            .get(index..end)
-            .is_some_and(|separators| {
-                separators
-                    .iter()
-                    .all(|separator| *separator == ParameterSeparator::Semicolon)
-            })
+    if parameters.get(end).is_none() {
+        return Err((
+            TerminalError::Unsupported("incomplete extended color"),
+            parameters.len(),
+        ));
+    }
+    if let Some(offset) = csi.parameter_separators()
+        [index..=end.min(csi.parameter_separators().len() - 1)]
+        .iter()
+        .position(|separator| *separator == ParameterSeparator::Colon)
     {
-        return Err(TerminalError::Unsupported(
-            "malformed extended color grouping",
+        return Err((
+            TerminalError::Unsupported("malformed extended color grouping"),
+            index + offset + 1,
         ));
     }
 
@@ -2854,39 +4169,60 @@ fn parse_semicolon_extended_color(
         5 => Color::Indexed(parse_color_component(
             parameters[index + 2],
             "indexed color",
+            index + 2,
         )?),
         2 => Color::Rgb(
-            parse_color_component(parameters[index + 2], "RGB color")?,
-            parse_color_component(parameters[index + 3], "RGB color")?,
-            parse_color_component(parameters[index + 4], "RGB color")?,
+            parse_color_component(parameters[index + 2], "RGB color", index + 2)?,
+            parse_color_component(parameters[index + 3], "RGB color", index + 3)?,
+            parse_color_component(parameters[index + 4], "RGB color", index + 4)?,
         ),
         _ => unreachable!("extended color mode was validated"),
     };
     Ok((color, end))
 }
 
-fn parse_colon_extended_color(group: &[u16]) -> Result<Color, TerminalError> {
+fn parse_colon_extended_color(group: &[u16]) -> Result<Color, (TerminalError, usize)> {
     let color = match group {
-        [38 | 48 | 58, 5, value] => Color::Indexed(parse_color_component(*value, "indexed color")?),
+        [38 | 48 | 58, 5, value] => {
+            Color::Indexed(parse_color_component(*value, "indexed color", 2)?)
+        }
         [38 | 48 | 58, 2, color_space, red, green, blue]
             if *color_space == PARAM_MISSING || *color_space == 0 =>
         {
             Color::Rgb(
-                parse_color_component(*red, "RGB color")?,
-                parse_color_component(*green, "RGB color")?,
-                parse_color_component(*blue, "RGB color")?,
+                parse_color_component(*red, "RGB color", 3)?,
+                parse_color_component(*green, "RGB color", 4)?,
+                parse_color_component(*blue, "RGB color", 5)?,
             )
         }
         [38 | 48 | 58, 2, _, _, _, _] => {
-            return Err(TerminalError::Unsupported("SGR color space"));
+            return Err((TerminalError::Unsupported("SGR color space"), 2));
         }
-        _ => return Err(TerminalError::Unsupported("malformed SGR colon color")),
+        [_, mode, ..] if !matches!(mode, 2 | 5) => {
+            return Err((TerminalError::Unsupported("extended color mode"), 1));
+        }
+        [_, 5, ..] => {
+            return Err((
+                TerminalError::Unsupported("malformed SGR colon color"),
+                if group.len() > 3 { 3 } else { group.len() },
+            ));
+        }
+        _ => {
+            return Err((
+                TerminalError::Unsupported("malformed SGR colon color"),
+                if group.len() > 6 { 6 } else { group.len() },
+            ));
+        }
     };
     Ok(color)
 }
 
-fn parse_color_component(value: u16, feature: &'static str) -> Result<u8, TerminalError> {
-    u8::try_from(value).map_err(|_| TerminalError::Unsupported(feature))
+fn parse_color_component(
+    value: u16,
+    feature: &'static str,
+    index: usize,
+) -> Result<u8, (TerminalError, usize)> {
+    u8::try_from(value).map_err(|_| (TerminalError::Unsupported(feature), index))
 }
 
 fn validate_dimensions(columns: u32, rows: u32) -> Result<(), TerminalError> {
@@ -2919,8 +4255,11 @@ fn validate_capture_events(events: &[Event<'_>]) -> Result<(), TerminalError> {
 
 fn map_parse_error(error: ParseError) -> TerminalError {
     match error {
-        ParseError::OscPayloadAllocation | ParseError::DcsQueryPayloadAllocation => {
-            TerminalError::LimitExceeded
+        ParseError::OscPayloadAllocation
+        | ParseError::DcsQueryPayloadAllocation
+        | ParseError::ApcAllocation => TerminalError::LimitExceeded,
+        ParseError::ApcHeaderLimit | ParseError::ApcPayloadLimit => {
+            TerminalError::ProtocolResourceLimit(error.description())
         }
         other => TerminalError::Unsupported(other.description()),
     }
@@ -3017,3 +4356,9 @@ fn utf8_sequence_length(first: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod color_extensions_tests;
+
+#[cfg(test)]
+mod traditional_tests;

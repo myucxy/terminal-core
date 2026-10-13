@@ -1,9 +1,14 @@
+use super::sgr_stack::{
+    CAPACITY as SGR_STACK_CAPACITY, SELECTORS as SGR_STACK_SELECTORS, SavedRendition, SgrStack,
+};
 use std::cmp::Ordering;
 
 use super::charset::{
-    CharsetSize, CharsetState, GraphicCharset, GraphicRegister, NationalReplacementCharset,
+    CharsetDesignation, CharsetSize, CharsetState, GraphicCharset, GraphicRegister,
+    NationalReplacementCharset,
 };
 use super::crc32c;
+use super::drcs_bank::GlyphReference;
 use super::modes::{
     AttributeChangeExtent, KITTY_KEYBOARD_STACK_CAPACITY, KITTY_KEYBOARD_SUPPORTED_FLAGS,
     KeyboardProtocolStack, Margins, ModeState, ModifyOtherKeys, MouseEncoding, MouseTracking,
@@ -13,11 +18,12 @@ use super::screen::{
     MAX_HISTORY_ROWS, ROW_FLAG_HEAD_TRUNCATED, RowMetadata, SavedCursor, Screen, StoragePolicy,
 };
 use super::tabs::TabStops;
-use super::unicode_width::{WIDTH_PROFILE_VERSION, grapheme_width, scalar_width};
+#[cfg(test)]
+use super::unicode_width::scalar_width;
 use super::{
-    Attributes, Cell, Color, CursorShape, MAX_CELLS, MAX_GRAPHEME_BYTES, MAX_ROWS,
-    MAX_SNAPSHOT_BYTES, OutputProfile, ParserState, RepeatSource, StringUtf8Boundary, Terminal,
-    TerminalError, UnderlineStyle, Utf8Decoder, validate_dimensions,
+    Attributes, Cell, Color, CursorShape, MAX_CELLS, MAX_ROWS, MAX_SNAPSHOT_BYTES, OutputProfile,
+    ParserState, RepeatSource, StringUtf8Boundary, Terminal, TerminalError, UnderlineStyle,
+    Utf8Decoder, validate_dimensions,
 };
 
 const MAGIC: &[u8; 8] = b"TLSNP2S\0";
@@ -33,10 +39,25 @@ const MINOR_V2_7: u16 = 7;
 const MINOR_V2_8: u16 = 8;
 const MINOR_V2_9: u16 = 9;
 const MINOR_V2_10: u16 = 10;
+const MINOR_V2_11: u16 = 11;
+const MINOR_V2_12: u16 = 12;
+const MINOR_V2_13: u16 = 13;
+const MINOR_V2_14: u16 = 14;
+const MINOR_V2_15: u16 = 15;
+const MINOR_V2_16: u16 = 16;
+const MINOR_V2_17: u16 = 17;
+const MINOR_V2_18: u16 = 18;
+const MINOR_V2_19: u16 = 19;
+const MINOR_V2_20: u16 = 20;
+const MINOR_V2_21: u16 = 21;
+const MINOR_V2_22: u16 = 22;
 const HEADER_SIZE: usize = 104;
 const DIRECTORY_ENTRY_SIZE: usize = 32;
 const SECTION_COUNT: usize = 12;
+#[cfg(test)]
 const SECTION_COUNT_V2_6: usize = 13;
+const MAX_LEGACY_KNOWN_SECTIONS: usize = 20;
+const MAX_KNOWN_SECTIONS: usize = MAX_LEGACY_KNOWN_SECTIONS + 1;
 const MAX_SECTIONS: usize = 64;
 const CRITICAL: u16 = 1;
 const REQUIRED_FEATURES_V2_0: u128 = 0x18ff;
@@ -50,6 +71,22 @@ const NATIONAL_REPLACEMENT_CHARSET_FEATURE: u128 = 0x8_0000;
 const STANDALONE_C1_OUTPUT_PROFILE_FEATURE: u128 = 0x10_0000;
 const MODERN_PRIVATE_MODES_FEATURE: u128 = 0x20_0000;
 const RETAINED_PRIMARY_SCROLLBACK_FEATURE: u128 = 0x40_0000;
+const SGR_STACK_FEATURE: u128 = 0x80_0000;
+const ALTERNATE_SCROLL_FEATURE: u128 = 0x100_0000;
+const UNICODE16_FEATURE: u128 = 0x200_0000;
+const LINE_RENDITION_FEATURE: u128 = 0x400_0000;
+const SHELL_INTEGRATION_FEATURE: u128 = 0x2_0000_0000;
+const GRAPHICS_FEATURE: u128 = 0x8_0000_0000;
+const HOST_SIGNALS_FEATURE: u128 = 0x4_0000_0000;
+const HOST_THEME_FEATURE: u128 = 0x1_0000_0000;
+const HOST_GEOMETRY_FEATURE: u128 = 0x8000_0000;
+const PAGES_FEATURE: u128 = 0x4000_0000;
+const MACROS_FEATURE: u128 = 0x2000_0000;
+const COLOR_EXTENSIONS_FEATURE: u128 = 0x800_0000;
+const TRADITIONAL_MODES_FEATURE: u128 = 0x1000_0000;
+const NEW_FEATURES_V2_11: u128 = SGR_STACK_FEATURE | ALTERNATE_SCROLL_FEATURE;
+const OPTIONAL_FEATURES_V2_11: u128 =
+    OPTIONAL_FEATURES_V2_10 | HISTORY_ANCHORS_FEATURE | RETAINED_PRIMARY_SCROLLBACK_FEATURE;
 const OPTIONAL_FEATURES_V2_5: u128 =
     HISTORY_ANCHORS_FEATURE | REP_SOURCE_FEATURE | CURSOR_STYLE_FEATURE | EXTENDED_SGR_FEATURE;
 const REQUIRED_FEATURES_V2_5: u128 = REQUIRED_FEATURES_V2_0 | WIN32_INPUT_MODE_FEATURE;
@@ -116,26 +153,37 @@ const REQUIRED_FEATURES_V2_4_HISTORY_REPEAT_CURSOR: u128 =
 // The two screens are independently capped at MAX_CELLS. The mandatory blank
 // grapheme and the four screen/saved-cursor renditions can add entries that do
 // not occur in either cell array.
-const MAX_GRAPHEME_TABLE_ENTRIES: usize = 2 * MAX_CELLS + 2;
-const MAX_RENDITION_TABLE_ENTRIES: usize = 2 * MAX_CELLS + 5;
+const MAX_GRAPHEME_TABLE_ENTRIES: usize = 2 * MAX_CELLS + crate::pages::MAX_EXTRA_CELLS + 2;
+const MAX_RENDITION_TABLE_ENTRIES: usize =
+    2 * MAX_CELLS + crate::pages::MAX_EXTRA_CELLS + 15 + SGR_STACK_CAPACITY;
 const GRAPHEME_WIDTH_WORDS: usize = MAX_GRAPHEME_TABLE_ENTRIES.div_ceil(u64::BITS as usize);
 const RENDITION_USE_WORDS: usize = MAX_RENDITION_TABLE_ENTRIES.div_ceil(u64::BITS as usize);
-const ENVELOPE_BYTES: usize = HEADER_SIZE + SECTION_COUNT_V2_6 * DIRECTORY_ENTRY_SIZE;
-const MAX_GRAPHEME_SECTION_BYTES: usize = 16 + (MAX_GRAPHEME_TABLE_ENTRIES - 1) * 20;
+const ENVELOPE_BYTES: usize = HEADER_SIZE + MAX_LEGACY_KNOWN_SECTIONS * DIRECTORY_ENTRY_SIZE;
+const MAX_GRAPHEME_SECTION_BYTES: usize = 16 + (MAX_GRAPHEME_TABLE_ENTRIES - 1) * 52;
 const MAX_RENDITION_SECTION_BYTES: usize = 8 + MAX_RENDITION_TABLE_ENTRIES * 48;
 const MAX_LEGACY_ROWS_SECTION_BYTES: usize = 8 + MAX_ROWS as usize * 24 + MAX_CELLS * 16;
 const MAX_PRIMARY_ROWS_SECTION_BYTES: usize =
     16 + (MAX_ROWS as usize + MAX_HISTORY_ROWS as usize) * 32 + MAX_CELLS * 16;
 
+const MAX_PAGES_SECTION_BYTES: usize =
+    16 + 5 * (8 + 64 + 8 + MAX_ROWS as usize * 24) + crate::pages::MAX_EXTRA_CELLS * 16;
+
 // Every payload bound below is independent and conservative. There is one
 // pre-section alignment per directory entry and one final alignment.
 const MAX_CANONICAL_SNAPSHOT_BYTES: usize = ENVELOPE_BYTES
     + 32 // core
-    + 152 // at most eighteen mode records
+    + 200 // at most twenty-four mode records
     + 24 // margins
     + 72 // tab stops
     + 24 // two bounded Kitty keyboard-protocol stacks
-    + 44 // charset records
+    + 8 + SGR_STACK_CAPACITY * 8
+    + crate::macros::MAX_SNAPSHOT_BYTES
+    + MAX_PAGES_SECTION_BYTES
+    + crate::HOST_GEOMETRY_V1_BYTES
+    + crate::host_theme::THEME_STATE_BYTES
+    + crate::MAX_SHELL_STATE_BYTES
+    + crate::HOST_SIGNALS_V1_BYTES
+    + 52 // charset records and optional preference
     + MAX_OSC_SNAPSHOT_V2_BYTES
     + MAX_GRAPHEME_SECTION_BYTES
     + MAX_RENDITION_SECTION_BYTES
@@ -143,14 +191,22 @@ const MAX_CANONICAL_SNAPSHOT_BYTES: usize = ENVELOPE_BYTES
     + MAX_PRIMARY_ROWS_SECTION_BYTES
     + 64 // alternate metadata
     + MAX_LEGACY_ROWS_SECTION_BYTES
-    + (SECTION_COUNT_V2_6 + 1) * 7;
+    + (MAX_LEGACY_KNOWN_SECTIONS + 1) * 7;
 const _: () = assert!(MAX_CANONICAL_SNAPSHOT_BYTES <= MAX_SNAPSHOT_BYTES);
+const MAX_CANONICAL_GRAPHICS_SNAPSHOT_BYTES: usize = MAX_CANONICAL_SNAPSHOT_BYTES
+    + 39
+    + crate::graphics_state::MAX_GRAPHICS_STATE_BYTES
+    + 20 * (MAX_GRAPHEME_TABLE_ENTRIES - 1)
+    + 36; // Three charset records grow from 12 to 24 bytes.
+const _: () = assert!(MAX_CANONICAL_GRAPHICS_SNAPSHOT_BYTES <= crate::MAX_GRAPHICS_SNAPSHOT_BYTES);
 
 const CORE_STATE: u32 = 0x0000_0001;
 const MODE_BANK: u32 = 0x0000_0002;
 const MARGINS: u32 = 0x0000_0003;
 const TAB_STOPS: u32 = 0x0000_0004;
 const KEYBOARD_PROTOCOL_STATE: u32 = 0x0000_0008;
+const MACROS_STATE: u32 = 0x0000_0018;
+const SGR_STACK_STATE: u32 = 0x0000_0010;
 const CHARSET_STATE: u32 = 0x0000_0020;
 const OSC_STATE: u32 = 0x0000_0040;
 const GRAPHEME_TABLE: u32 = 0x0000_0100;
@@ -159,28 +215,21 @@ const PRIMARY_META: u32 = 0x0000_0200;
 const PRIMARY_ROWS: u32 = 0x0000_0201;
 const ALTERNATE_META: u32 = 0x0000_0210;
 const ALTERNATE_ROWS: u32 = 0x0000_0211;
+const PAGES_STATE: u32 = 0x0000_0300;
+const HOST_GEOMETRY_STATE: u32 = 0x0000_0400;
+const HOST_THEME_STATE: u32 = 0x0000_0401;
+const SHELL_INTEGRATION_STATE: u32 = 0x0000_0402;
+const HOST_SIGNALS_STATE: u32 = 0x0000_0403;
+const GRAPHICS_STATE: u32 = 0x0000_0500;
 
-const TAGS: [u32; SECTION_COUNT] = [
-    CORE_STATE,
-    MODE_BANK,
-    MARGINS,
-    TAB_STOPS,
-    CHARSET_STATE,
-    OSC_STATE,
-    GRAPHEME_TABLE,
-    RENDITION_TABLE,
-    PRIMARY_META,
-    PRIMARY_ROWS,
-    ALTERNATE_META,
-    ALTERNATE_ROWS,
-];
-
-const TAGS_V2_6: [u32; SECTION_COUNT_V2_6] = [
+const ALL_TAGS: [u32; MAX_KNOWN_SECTIONS] = [
     CORE_STATE,
     MODE_BANK,
     MARGINS,
     TAB_STOPS,
     KEYBOARD_PROTOCOL_STATE,
+    SGR_STACK_STATE,
+    MACROS_STATE,
     CHARSET_STATE,
     OSC_STATE,
     GRAPHEME_TABLE,
@@ -189,6 +238,12 @@ const TAGS_V2_6: [u32; SECTION_COUNT_V2_6] = [
     PRIMARY_ROWS,
     ALTERNATE_META,
     ALTERNATE_ROWS,
+    PAGES_STATE,
+    HOST_GEOMETRY_STATE,
+    HOST_THEME_STATE,
+    SHELL_INTEGRATION_STATE,
+    HOST_SIGNALS_STATE,
+    GRAPHICS_STATE,
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -221,6 +276,42 @@ struct ScreenMeta {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SnapshotVersion {
+    V2_22 {
+        features: u128,
+    },
+    V2_21 {
+        features: u128,
+    },
+    V2_20 {
+        features: u128,
+    },
+    V2_19 {
+        features: u128,
+    },
+    V2_18 {
+        features: u128,
+    },
+    V2_17 {
+        features: u128,
+    },
+    V2_16 {
+        features: u128,
+    },
+    V2_15 {
+        features: u128,
+    },
+    V2_14 {
+        features: u128,
+    },
+    V2_13 {
+        features: u128,
+    },
+    V2_12 {
+        features: u128,
+    },
+    V2_11 {
+        features: u128,
+    },
     V2_0,
     V2_1,
     V2_2 {
@@ -289,6 +380,112 @@ enum SnapshotVersion {
 
 impl SnapshotVersion {
     fn for_terminal(terminal: &Terminal) -> Self {
+        let legacy = Self::for_legacy_terminal(terminal);
+        let extensions = if terminal.sgr_stack.is_empty() {
+            0
+        } else {
+            SGR_STACK_FEATURE
+        } | if terminal.modes.alternate_scroll {
+            ALTERNATE_SCROLL_FEATURE
+        } else {
+            0
+        };
+        let base = if terminal.main.has_line_renditions()
+            || terminal.alternate.has_line_renditions()
+            || terminal.pages.screens().any(Screen::has_line_renditions)
+        {
+            Self::V2_13 {
+                features: legacy.required_features()
+                    | extensions
+                    | LINE_RENDITION_FEATURE
+                    | if terminal.width_profile() == crate::WidthProfile::Unicode16 {
+                        UNICODE16_FEATURE
+                    } else {
+                        0
+                    },
+            }
+        } else if terminal.width_profile() == crate::WidthProfile::Unicode16 {
+            Self::V2_12 {
+                features: legacy.required_features() | extensions | UNICODE16_FEATURE,
+            }
+        } else if extensions == 0 {
+            legacy
+        } else {
+            Self::V2_11 {
+                features: legacy.required_features() | extensions,
+            }
+        };
+        let base = if terminal.osc.has_extended_colors() {
+            Self::V2_14 {
+                features: base.required_features() | COLOR_EXTENSIONS_FEATURE,
+            }
+        } else {
+            base
+        };
+        let base = if terminal.modes.has_traditional_modes()
+            || terminal.charset.has_extended()
+            || terminal.main_saved_charset.has_extended()
+            || terminal.alternate_saved_charset.has_extended()
+            || terminal.user_preferred_charset != CharsetDesignation::LATIN1
+        {
+            Self::V2_15 {
+                features: base.required_features() | TRADITIONAL_MODES_FEATURE,
+            }
+        } else {
+            base
+        };
+        let base = if terminal.macros.is_empty() {
+            base
+        } else {
+            Self::V2_16 {
+                features: base.required_features() | MACROS_FEATURE,
+            }
+        };
+        let base = if terminal.pages.has_state() {
+            Self::V2_17 {
+                features: base.required_features() | PAGES_FEATURE,
+            }
+        } else {
+            base
+        };
+        let base = if terminal.host_geometry != crate::HostGeometryV1::default() {
+            Self::V2_18 {
+                features: base.required_features() | HOST_GEOMETRY_FEATURE,
+            }
+        } else {
+            base
+        };
+        let base = if terminal.osc.theme_scheme() != 0 {
+            Self::V2_19 {
+                features: base.required_features() | HOST_THEME_FEATURE,
+            }
+        } else {
+            base
+        };
+        let base = if terminal.shell_integration.has_state() {
+            Self::V2_20 {
+                features: base.required_features() | SHELL_INTEGRATION_FEATURE,
+            }
+        } else {
+            base
+        };
+        let base = if terminal.host_signals != crate::HostSignalsV1::default() {
+            Self::V2_21 {
+                features: base.required_features() | HOST_SIGNALS_FEATURE,
+            }
+        } else {
+            base
+        };
+        if terminal.graphics.is_some() {
+            Self::V2_22 {
+                features: base.required_features() | GRAPHICS_FEATURE | HISTORY_ANCHORS_FEATURE,
+            }
+        } else {
+            base
+        }
+    }
+
+    fn for_legacy_terminal(terminal: &Terminal) -> Self {
         let history = terminal.main.requested_history_rows() != 0;
         let repeat = terminal.repeat_source.is_some();
         let cursor_style = terminal.cursor_shape != CursorShape::Block || !terminal.cursor_blinking;
@@ -298,7 +495,11 @@ impl SnapshotVersion {
         let national_replacement = terminal.modes.national_replacement_character_set_mode
             || charset_has_national_replacement(terminal.charset)
             || charset_has_national_replacement(terminal.main_saved_charset)
-            || charset_has_national_replacement(terminal.alternate_saved_charset);
+            || charset_has_national_replacement(terminal.alternate_saved_charset)
+            || matches!(
+                terminal.user_preferred_charset.charset,
+                GraphicCharset::NationalReplacement(_)
+            );
         let modern_private_modes =
             terminal.modes.grapheme_clustering || terminal.modes.color_scheme_reporting;
         if history && terminal.main.viewport_top() != 0 {
@@ -375,6 +576,21 @@ impl SnapshotVersion {
     }
 
     fn has_history(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & HISTORY_ANCHORS_FEATURE != 0;
+        }
         matches!(
             self,
             Self::V2_1
@@ -391,6 +607,21 @@ impl SnapshotVersion {
     }
 
     fn has_repeat_source(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & REP_SOURCE_FEATURE != 0;
+        }
         matches!(
             self,
             Self::V2_2 { .. }
@@ -406,6 +637,21 @@ impl SnapshotVersion {
     }
 
     fn has_cursor_style(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & CURSOR_STYLE_FEATURE != 0;
+        }
         matches!(
             self,
             Self::V2_3 { .. }
@@ -420,6 +666,21 @@ impl SnapshotVersion {
     }
 
     fn has_extended_sgr(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & EXTENDED_SGR_FEATURE != 0;
+        }
         matches!(
             self,
             Self::V2_4 { .. }
@@ -451,6 +712,21 @@ impl SnapshotVersion {
     }
 
     fn has_win32_input_mode(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & WIN32_INPUT_MODE_FEATURE != 0;
+        }
         matches!(
             self,
             Self::V2_5 { .. }
@@ -478,6 +754,21 @@ impl SnapshotVersion {
     }
 
     fn has_keyboard_protocol_state(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & KEYBOARD_PROTOCOL_STATE_FEATURE != 0;
+        }
         matches!(
             self,
             Self::V2_6 { .. }
@@ -501,6 +792,21 @@ impl SnapshotVersion {
     }
 
     fn has_national_replacement_charset(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & NATIONAL_REPLACEMENT_CHARSET_FEATURE != 0;
+        }
         matches!(
             self,
             Self::V2_7 { .. }
@@ -520,6 +826,21 @@ impl SnapshotVersion {
     }
 
     fn has_standalone_c1_output_profile(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & STANDALONE_C1_OUTPUT_PROFILE_FEATURE != 0;
+        }
         matches!(
             self,
             Self::V2_8 { .. }
@@ -535,6 +856,21 @@ impl SnapshotVersion {
     }
 
     fn has_modern_private_modes(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & MODERN_PRIVATE_MODES_FEATURE != 0;
+        }
         matches!(
             self,
             Self::V2_9 { .. }
@@ -546,6 +882,21 @@ impl SnapshotVersion {
     }
 
     fn has_retained_primary_scrollback(self) -> bool {
+        if let Self::V2_11 { features }
+        | Self::V2_12 { features }
+        | Self::V2_13 { features }
+        | Self::V2_14 { features }
+        | Self::V2_15 { features }
+        | Self::V2_16 { features }
+        | Self::V2_17 { features }
+        | Self::V2_22 { features }
+        | Self::V2_21 { features }
+        | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } = self
+        {
+            return features & RETAINED_PRIMARY_SCROLLBACK_FEATURE != 0;
+        }
         matches!(self, Self::V2_10 { .. })
     }
 
@@ -637,6 +988,18 @@ impl SnapshotVersion {
 
     fn minor(self) -> u16 {
         match self {
+            Self::V2_13 { .. } => MINOR_V2_13,
+            Self::V2_14 { .. } => MINOR_V2_14,
+            Self::V2_15 { .. } => MINOR_V2_15,
+            Self::V2_16 { .. } => MINOR_V2_16,
+            Self::V2_17 { .. } => MINOR_V2_17,
+            Self::V2_22 { .. } => MINOR_V2_22,
+            Self::V2_21 { .. } => MINOR_V2_21,
+            Self::V2_20 { .. } => MINOR_V2_20,
+            Self::V2_19 { .. } => MINOR_V2_19,
+            Self::V2_18 { .. } => MINOR_V2_18,
+            Self::V2_12 { .. } => MINOR_V2_12,
+            Self::V2_11 { .. } => MINOR_V2_11,
             Self::V2_0 => MINOR_V2_0,
             Self::V2_1 => MINOR_V2_1,
             Self::V2_2 { .. } => MINOR_V2_2,
@@ -653,6 +1016,18 @@ impl SnapshotVersion {
 
     fn required_features(self) -> u128 {
         match self {
+            Self::V2_11 { features }
+            | Self::V2_12 { features }
+            | Self::V2_13 { features }
+            | Self::V2_14 { features }
+            | Self::V2_15 { features }
+            | Self::V2_16 { features }
+            | Self::V2_17 { features }
+            | Self::V2_22 { features }
+            | Self::V2_21 { features }
+            | Self::V2_20 { features }
+            | Self::V2_19 { features }
+            | Self::V2_18 { features } => features,
             Self::V2_0 => REQUIRED_FEATURES_V2_0,
             Self::V2_1 => REQUIRED_FEATURES_V2_1,
             Self::V2_2 { history: false } => REQUIRED_FEATURES_V2_2,
@@ -901,25 +1276,71 @@ impl SnapshotVersion {
         }
     }
 
-    fn section_count(self) -> usize {
-        if self.has_keyboard_protocol_state() {
-            SECTION_COUNT_V2_6
+    fn has_line_renditions(self) -> bool {
+        self.required_features() & LINE_RENDITION_FEATURE != 0
+    }
+
+    fn width_profile(self) -> crate::WidthProfile {
+        if self.required_features() & UNICODE16_FEATURE != 0 {
+            crate::WidthProfile::Unicode16
         } else {
-            SECTION_COUNT
+            crate::WidthProfile::LegacyV1
         }
     }
 
-    fn tags(self) -> &'static [u32] {
-        if self.has_keyboard_protocol_state() {
-            &TAGS_V2_6
-        } else {
-            &TAGS
-        }
+    fn section_count(self) -> usize {
+        self.tags().count()
+    }
+
+    fn has_sgr_stack(self) -> bool {
+        matches!(self, Self::V2_11 { features } | Self::V2_12 { features } | Self::V2_13 { features } | Self::V2_14 { features } | Self::V2_15 { features } | Self::V2_16 { features } | Self::V2_17 { features }
+        | Self::V2_22 { features } | Self::V2_21 { features } | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } if features & SGR_STACK_FEATURE != 0)
+    }
+
+    fn has_alternate_scroll(self) -> bool {
+        matches!(self, Self::V2_11 { features } | Self::V2_12 { features } | Self::V2_13 { features } | Self::V2_14 { features } | Self::V2_15 { features } | Self::V2_16 { features } | Self::V2_17 { features }
+        | Self::V2_22 { features } | Self::V2_21 { features } | Self::V2_20 { features }
+        | Self::V2_19 { features }
+        | Self::V2_18 { features } if features & ALTERNATE_SCROLL_FEATURE != 0)
+    }
+
+    fn tags(self) -> impl Iterator<Item = u32> {
+        ALL_TAGS.into_iter().filter(move |&tag| {
+            (tag != KEYBOARD_PROTOCOL_STATE || self.has_keyboard_protocol_state())
+                && (tag != GRAPHICS_STATE || self.required_features() & GRAPHICS_FEATURE != 0)
+                && (tag != HOST_SIGNALS_STATE
+                    || self.required_features() & HOST_SIGNALS_FEATURE != 0)
+                && (tag != SHELL_INTEGRATION_STATE
+                    || self.required_features() & SHELL_INTEGRATION_FEATURE != 0)
+                && (tag != HOST_THEME_STATE || self.required_features() & HOST_THEME_FEATURE != 0)
+                && (tag != SGR_STACK_STATE || self.has_sgr_stack())
+                && (tag != MACROS_STATE || self.required_features() & MACROS_FEATURE != 0)
+                && (tag != PAGES_STATE || self.required_features() & PAGES_FEATURE != 0)
+                && (tag != HOST_GEOMETRY_STATE
+                    || self.required_features() & HOST_GEOMETRY_FEATURE != 0)
+        })
     }
 
     fn section_version(self, tag: u32) -> u16 {
+        if self.required_features() & GRAPHICS_FEATURE != 0 {
+            match tag {
+                GRAPHEME_TABLE => return 2,
+                CHARSET_STATE => return 4,
+                _ => {}
+            }
+        }
+        if self.required_features() & TRADITIONAL_MODES_FEATURE != 0 && tag == CHARSET_STATE {
+            return 3;
+        }
+        if self.required_features() & TRADITIONAL_MODES_FEATURE != 0 && tag == MODE_BANK {
+            return 6;
+        }
         if self.has_retained_primary_scrollback() && matches!(tag, PRIMARY_META | PRIMARY_ROWS) {
             3
+        } else if self.has_alternate_scroll() && tag == MODE_BANK {
+            5
         } else if self.has_modern_private_modes() && tag == MODE_BANK {
             4
         } else if self.has_national_replacement_charset() && tag == MODE_BANK {
@@ -981,10 +1402,23 @@ fn terminal_has_extended_sgr(terminal: &Terminal) -> bool {
     .into_iter()
     .chain(
         terminal
+            .pages
+            .screens()
+            .flat_map(|page| [page.attributes, page.saved.attributes]),
+    )
+    .chain(terminal.sgr_stack.entries().map(|entry| entry.attributes))
+    .chain(
+        terminal
             .main
             .cells
             .iter()
             .chain(terminal.alternate.visible_cells())
+            .chain(
+                terminal
+                    .pages
+                    .screens()
+                    .flat_map(|page| page.visible_cells()),
+            )
             .map(|cell| cell.attributes),
     )
     .any(attributes_need_extended_sgr)
@@ -995,6 +1429,7 @@ struct GraphemeRef<'a> {
     character: char,
     combining: &'a str,
     width: u8,
+    glyph: Option<GlyphReference>,
 }
 
 impl GraphemeRef<'_> {
@@ -1003,6 +1438,7 @@ impl GraphemeRef<'_> {
             .cmp(&other.character)
             .then_with(|| self.combining.as_bytes().cmp(other.combining.as_bytes()))
             .then_with(|| self.width.cmp(&other.width))
+            .then_with(|| self.glyph.cmp(&other.glyph))
     }
 
     fn byte_len(self) -> usize {
@@ -1014,12 +1450,20 @@ struct GraphemeOwned {
     character: char,
     combining: String,
     width: u8,
+    glyph: Option<GlyphReference>,
 }
 
 pub(super) fn export(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
     terminal.ensure_presentation_eligible()?;
+    terminal.validate_graphics_anchors()?;
+    if terminal.main.width_profile != terminal.alternate.width_profile {
+        return Err(TerminalError::MalformedSnapshot);
+    }
     terminal.main.validate()?;
     terminal.alternate.validate()?;
+    terminal
+        .pages
+        .validate(terminal.columns, terminal.rows, terminal.width_profile())?;
     if terminal.main.viewport_top() != 0
         && terminal
             .main
@@ -1033,21 +1477,11 @@ pub(super) fn export(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
         return Err(TerminalError::MalformedSnapshot);
     }
     validate_margin_mode_consistency(terminal.modes, terminal.margins)?;
-    validate_active_screen_wrap_state(
-        if terminal.active_alternate {
-            &terminal.alternate
-        } else {
-            &terminal.main
-        },
-        terminal.modes,
-        terminal.margins,
-    )?;
+    validate_active_screen_wrap_state(terminal.active_screen(), terminal.modes, terminal.margins)?;
     if terminal.repeat_source.as_ref().is_some_and(|source| {
-        source.character.is_control()
-            || source.character.len_utf8() + source.combining.len() > MAX_GRAPHEME_BYTES
-            || !matches!(source.width, 1 | 2)
-            || grapheme_width(source.character, &source.combining) != source.width
-            || !valid_grapheme_suffix(&source.combining)
+        !terminal
+            .width_profile()
+            .valid_grapheme(source.character, &source.combining, source.width)
     }) {
         return Err(TerminalError::MalformedSnapshot);
     }
@@ -1056,6 +1490,12 @@ pub(super) fn export(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
         .cells
         .iter()
         .chain(terminal.alternate.visible_cells())
+        .chain(
+            terminal
+                .pages
+                .screens()
+                .flat_map(|page| page.visible_cells()),
+        )
         .filter_map(|cell| cell.hyperlink)
         .any(|reference| terminal.osc.hyperlink(reference).is_none())
     {
@@ -1091,6 +1531,27 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
         return Err(TerminalError::MalformedSnapshot);
     }
     let version = SnapshotVersion::for_terminal(terminal);
+    if version.required_features() & GRAPHICS_FEATURE == 0
+        && [
+            terminal.charset,
+            terminal.main_saved_charset,
+            terminal.alternate_saved_charset,
+        ]
+        .into_iter()
+        .flat_map(|state| {
+            [
+                GraphicRegister::G0,
+                GraphicRegister::G1,
+                GraphicRegister::G2,
+                GraphicRegister::G3,
+            ]
+            .map(|register| state.designation(register))
+        })
+        .chain([terminal.user_preferred_charset])
+        .any(|designation| designation.charset == GraphicCharset::Soft)
+    {
+        return Err(TerminalError::IncompatibleSnapshot);
+    }
     let section_count = version.section_count();
     let graphemes = collect_graphemes(terminal, version)?;
     let renditions = collect_renditions(terminal, version)?;
@@ -1099,9 +1560,12 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
         .encode_snapshot_v2()
         .map_err(map_osc_export_error)?;
     let mut writer = Writer::new();
+    if version.required_features() & GRAPHICS_FEATURE != 0 {
+        writer.limit = crate::MAX_GRAPHICS_SNAPSHOT_BYTES;
+    }
     writer.zeros(HEADER_SIZE + section_count * DIRECTORY_ENTRY_SIZE);
     writer.align8();
-    let mut descs = [SectionDesc::default(); SECTION_COUNT_V2_6];
+    let mut descs = [SectionDesc::default(); MAX_KNOWN_SECTIONS];
     let mut index = 0;
 
     macro_rules! section {
@@ -1140,6 +1604,31 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
             encode_keyboard_protocol_state(&mut writer, terminal,)
         );
     }
+    if version.has_sgr_stack() {
+        section!(SGR_STACK_STATE, {
+            let count = terminal.sgr_stack.entries().count() as u32;
+            writer.u32(count);
+            writer.u32(0);
+            for entry in terminal.sgr_stack.entries() {
+                writer.u32(entry.mask);
+                writer.u32(rendition_id(&renditions, entry.attributes, version));
+            }
+            count
+        });
+    }
+    if version.required_features() & MACROS_FEATURE != 0 {
+        section!(MACROS_STATE, {
+            let count = terminal.macros.entries().count() as u32;
+            writer.u32(count);
+            writer.u32(terminal.macros.used() as u32);
+            for (id, bytes) in terminal.macros.entries() {
+                writer.u32(id as u32);
+                writer.u32(bytes.len() as u32);
+                writer.bytes(bytes);
+            }
+            count
+        });
+    }
     section!(CHARSET_STATE, {
         encode_charsets(&mut writer, terminal);
         3
@@ -1149,7 +1638,7 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
         1
     });
     section!(GRAPHEME_TABLE, {
-        encode_graphemes(&mut writer, &graphemes);
+        encode_graphemes(&mut writer, &graphemes, version);
         graphemes.len() as u32
     });
     section!(RENDITION_TABLE, {
@@ -1192,6 +1681,65 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
             false,
         )
     );
+    if version.required_features() & PAGES_FEATURE != 0 {
+        section!(PAGES_STATE, {
+            writer.u8(terminal.pages.active);
+            writer.u8(terminal.pages.visible);
+            writer.u8(terminal.pages.saved);
+            writer.u8(u8::from(terminal.pages.coupled));
+            let count = terminal.pages.screens().count() as u32;
+            writer.u32(count);
+            writer.u64(0);
+            for (index, page) in terminal.pages.extra.iter().enumerate() {
+                if let Some(page) = page {
+                    writer.u32(index as u32 + 2);
+                    let size_at = writer.len();
+                    writer.u32(0);
+                    encode_screen_meta(&mut writer, page, &renditions, version, false);
+                    let rows_at = writer.len();
+                    encode_rows(&mut writer, page, &graphemes, &renditions, version, false);
+                    writer.patch_u32(size_at, (writer.len() - rows_at) as u32);
+                }
+            }
+            count
+        });
+    }
+    if version.required_features() & HOST_GEOMETRY_FEATURE != 0 {
+        section!(HOST_GEOMETRY_STATE, {
+            writer.bytes(&terminal.host_geometry.encode());
+            1
+        });
+    }
+    if version.required_features() & HOST_THEME_FEATURE != 0 {
+        section!(HOST_THEME_STATE, {
+            writer.bytes(&terminal.osc.encode_theme_state());
+            1
+        });
+    }
+    if version.required_features() & SHELL_INTEGRATION_FEATURE != 0 {
+        section!(SHELL_INTEGRATION_STATE, {
+            writer.bytes(&terminal.shell_integration.encode()?);
+            1
+        });
+    }
+    if version.required_features() & HOST_SIGNALS_FEATURE != 0 {
+        section!(HOST_SIGNALS_STATE, {
+            writer.bytes(&terminal.host_signals.encode());
+            1
+        });
+    }
+    if version.required_features() & GRAPHICS_FEATURE != 0 {
+        section!(GRAPHICS_STATE, {
+            writer.bytes(
+                &terminal
+                    .graphics
+                    .as_ref()
+                    .ok_or(TerminalError::MalformedSnapshot)?
+                    .encode()?,
+            );
+            1
+        });
+    }
     debug_assert_eq!(index, section_count);
     writer.align8();
     writer.check()?;
@@ -1215,7 +1763,7 @@ fn encode_terminal(terminal: &Terminal) -> Result<Vec<u8>, TerminalError> {
     writer.patch_u64(32, HEADER_SIZE as u64);
     writer.patch_u32(40, section_count as u32);
     writer.patch_u32(44, 1);
-    writer.patch_u32(48, u32::from(WIDTH_PROFILE_VERSION));
+    writer.patch_u32(48, terminal.width_profile() as u32);
     writer.patch_u32(52, 1);
     writer.patch_u32(56, 1);
     writer.patch_u32(60, 1);
@@ -1241,6 +1789,15 @@ fn collect_graphemes(
     let capacity = main_cells
         .len()
         .checked_add(terminal.alternate.visible_cells().len())
+        .and_then(|v| {
+            v.checked_add(
+                terminal
+                    .pages
+                    .screens()
+                    .map(|s| s.cells.len())
+                    .sum::<usize>(),
+            )
+        })
         .and_then(|v| v.checked_add(1 + usize::from(terminal.repeat_source.is_some())))
         .ok_or(TerminalError::LimitExceeded)?;
     let mut values = Vec::new();
@@ -1251,25 +1808,42 @@ fn collect_graphemes(
         character: ' ',
         combining: "",
         width: 1,
+        glyph: None,
     });
     if let Some(source) = &terminal.repeat_source {
         values.push(GraphemeRef {
             character: source.character,
             combining: &source.combining,
             width: source.width,
+            glyph: source.glyph,
         });
     }
-    for cell in main_cells.iter().chain(terminal.alternate.visible_cells()) {
+    for cell in main_cells
+        .iter()
+        .chain(terminal.alternate.visible_cells())
+        .chain(
+            terminal
+                .pages
+                .screens()
+                .flat_map(|page| page.visible_cells()),
+        )
+    {
         if !cell.continuation {
             values.push(GraphemeRef {
                 character: cell.character,
                 combining: &cell.combining,
                 width: cell.width,
+                glyph: cell.glyph,
             });
         }
     }
     values.sort_unstable_by(|a, b| a.compare(*b));
     values.dedup();
+    if version.required_features() & GRAPHICS_FEATURE == 0
+        && values.iter().any(|value| value.glyph.is_some())
+    {
+        return Err(TerminalError::IncompatibleSnapshot);
+    }
     Ok(values)
 }
 
@@ -1285,7 +1859,20 @@ fn collect_renditions(
     let capacity = main_cells
         .len()
         .checked_add(terminal.alternate.visible_cells().len())
-        .and_then(|v| v.checked_add(5))
+        .and_then(|v| {
+            v.checked_add(
+                terminal
+                    .pages
+                    .screens()
+                    .map(|s| s.cells.len())
+                    .sum::<usize>(),
+            )
+        })
+        .and_then(|v| {
+            v.checked_add(
+                5 + 2 * terminal.pages.screens().count() + terminal.sgr_stack.entries().count(),
+            )
+        })
         .ok_or(TerminalError::LimitExceeded)?;
     let mut values = Vec::new();
     values
@@ -1298,9 +1885,25 @@ fn collect_renditions(
         terminal.alternate.attributes,
         terminal.alternate.saved.attributes,
     ]);
-    for cell in main_cells.iter().chain(terminal.alternate.visible_cells()) {
+    for cell in main_cells
+        .iter()
+        .chain(terminal.alternate.visible_cells())
+        .chain(
+            terminal
+                .pages
+                .screens()
+                .flat_map(|page| page.visible_cells()),
+        )
+    {
         values.push(cell.attributes);
     }
+    values.extend(
+        terminal
+            .pages
+            .screens()
+            .flat_map(|page| [page.attributes, page.saved.attributes]),
+    );
+    values.extend(terminal.sgr_stack.entries().map(|entry| entry.attributes));
     values.sort_unstable_by_key(|a| rendition_bytes(*a, version));
     values.dedup();
     Ok(values)
@@ -1330,6 +1933,7 @@ fn encode_core(
                 character: source.character,
                 combining: &source.combining,
                 width: source.width,
+                glyph: source.glyph,
             },
         );
         if id == u32::MAX {
@@ -1364,6 +1968,11 @@ fn mode_parameter_encoding(value: MouseEncoding) -> u16 {
 
 fn encode_modes(writer: &mut Writer, modes: ModeState) -> u32 {
     let mut records = [
+        (4, 1, modes.vt52),
+        (4, 5, modes.send_c1),
+        (4, 2, modes.iso2022),
+        (4, 3, modes.receive_c1 == 1),
+        (4, 4, modes.receive_c1 == 2),
         (0, 4, modes.insert_mode),
         (0, 20, modes.newline_mode),
         (1, 1, modes.cursor_keys_application),
@@ -1374,6 +1983,7 @@ fn encode_modes(writer: &mut Writer, modes: ModeState) -> u32 {
         (1, 66, modes.keypad_application),
         (1, 69, modes.left_right_margin),
         (1, 1004, modes.focus_reporting),
+        (1, 1007, modes.alternate_scroll),
         (1, 2004, modes.bracketed_paste),
         (1, 2027, modes.grapheme_clustering),
         (1, 2031, modes.color_scheme_reporting),
@@ -1453,37 +2063,76 @@ fn encode_keyboard_protocol_state(writer: &mut Writer, terminal: &Terminal) -> u
 }
 
 fn encode_charsets(writer: &mut Writer, terminal: &Terminal) {
+    let version = SnapshotVersion::for_terminal(terminal);
+    let graphics = version.required_features() & GRAPHICS_FEATURE != 0;
     writer.u32(3);
-    writer.u32(12);
-    encode_charset(writer, terminal.charset);
-    encode_charset(writer, terminal.main_saved_charset);
-    encode_charset(writer, terminal.alternate_saved_charset);
+    writer.u32(if graphics { 24 } else { 12 });
+    encode_charset(writer, terminal.charset, graphics);
+    encode_charset(writer, terminal.main_saved_charset, graphics);
+    encode_charset(writer, terminal.alternate_saved_charset, graphics);
+    if version.required_features() & TRADITIONAL_MODES_FEATURE != 0 {
+        if graphics {
+            encode_raw_designation(writer, terminal.user_preferred_charset);
+        } else {
+            writer.u8(charset_wire_id(terminal.user_preferred_charset));
+            writer.u8(0);
+            writer.u16(0);
+        }
+        writer.u32(0);
+    }
 }
 
-fn encode_charset(writer: &mut Writer, charset: CharsetState) {
+fn encode_raw_designation(writer: &mut Writer, designation: CharsetDesignation) {
+    writer.u8(match designation.size {
+        CharsetSize::Characters94 => 94,
+        CharsetSize::Characters96 => 96,
+    });
+    let bytes = designation.designator();
+    writer.bytes(bytes);
+    writer.zeros(3 - bytes.len());
+}
+
+fn charset_wire_id(designation: CharsetDesignation) -> u8 {
+    match designation.charset {
+        GraphicCharset::Soft => unreachable!("soft designations require graphics charset records"),
+        GraphicCharset::Extended(set) => 15 + set.id(),
+        GraphicCharset::UserPreferred => {
+            if designation.size == CharsetSize::Characters94 {
+                31
+            } else {
+                32
+            }
+        }
+        GraphicCharset::Ascii => 0,
+        GraphicCharset::DecSpecialGraphics => 1,
+        GraphicCharset::IsoLatin1Supplemental => 2,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::British) => 3,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::Dutch) => 4,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::Finnish) => 5,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::French) => 6,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::FrenchCanadian) => 7,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::German) => 8,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::Italian) => 9,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::NorwegianDanish) => 10,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::Portuguese) => 11,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::Spanish) => 12,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::Swedish) => 13,
+        GraphicCharset::NationalReplacement(NationalReplacementCharset::Swiss) => 14,
+    }
+}
+
+fn encode_charset(writer: &mut Writer, charset: CharsetState, graphics: bool) {
     for register in [
         GraphicRegister::G0,
         GraphicRegister::G1,
         GraphicRegister::G2,
         GraphicRegister::G3,
     ] {
-        writer.u8(match charset.designation(register).charset {
-            GraphicCharset::Ascii => 0,
-            GraphicCharset::DecSpecialGraphics => 1,
-            GraphicCharset::IsoLatin1Supplemental => 2,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::British) => 3,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::Dutch) => 4,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::Finnish) => 5,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::French) => 6,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::FrenchCanadian) => 7,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::German) => 8,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::Italian) => 9,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::NorwegianDanish) => 10,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::Portuguese) => 11,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::Spanish) => 12,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::Swedish) => 13,
-            GraphicCharset::NationalReplacement(NationalReplacementCharset::Swiss) => 14,
-        });
+        if graphics {
+            encode_raw_designation(writer, charset.designation(register));
+        } else {
+            writer.u8(charset_wire_id(charset.designation(register)));
+        }
     }
     writer.u8(match charset.gl() {
         GraphicRegister::G0 => 0,
@@ -1507,13 +2156,20 @@ fn encode_charset(writer: &mut Writer, charset: CharsetState) {
     writer.u32(0);
 }
 
-fn encode_graphemes(writer: &mut Writer, values: &[GraphemeRef<'_>]) {
+fn encode_graphemes(writer: &mut Writer, values: &[GraphemeRef<'_>], version: SnapshotVersion) {
     writer.u32(values.len() as u32);
     writer.u32(0);
     for value in values {
         writer.u16(value.byte_len() as u16);
         writer.u8(value.width);
-        writer.u8(0);
+        writer.u8(u8::from(value.glyph.is_some()));
+        if let Some(glyph) = value.glyph {
+            debug_assert!(version.required_features() & GRAPHICS_FEATURE != 0);
+            writer.u64(glyph.resource);
+            writer.u32(glyph.x);
+            writer.u32(glyph.width);
+            writer.u32(glyph.height);
+        }
         let mut scalar = [0; 4];
         writer.bytes(value.character.encode_utf8(&mut scalar).as_bytes());
         writer.bytes(value.combining.as_bytes());
@@ -1588,6 +2244,7 @@ fn grapheme_id(values: &[GraphemeRef<'_>], cell: &Cell) -> u32 {
             character: cell.character,
             combining: &cell.combining,
             width: cell.width,
+            glyph: cell.glyph,
         },
     )
 }
@@ -1702,6 +2359,7 @@ fn encode_rows(
         writer.u32(screen.meaningful_end[stored_row]);
         writer.u32(
             u32::from(screen.soft_wrapped[stored_row])
+                | ((screen.line_renditions[stored_row] as u32) << 2)
                 | if version.has_history() {
                     u32::from(head_truncated) << 1
                 } else {
@@ -1765,6 +2423,7 @@ fn count_runs(cells: &[Cell], width: usize, row: usize) -> usize {
                 || candidate.character != cell.character
                 || candidate.combining != cell.combining
                 || candidate.width != cell.width
+                || candidate.glyph != cell.glyph
                 || candidate.attributes != cell.attributes
                 || candidate.protected != cell.protected
                 || candidate.hyperlink != cell.hyperlink
@@ -1802,6 +2461,43 @@ pub(super) fn import(bytes: &[u8]) -> Result<Terminal, TerminalError> {
     let preflight = preflight_a(bytes)?;
     preflight_b(bytes, &preflight)?;
     decode_terminal(bytes, &preflight)
+}
+
+/// Borrowed canonical sections for the additive state-delta codec. The same
+/// preflights as import run before exposing any slice; pixels remain borrowed.
+pub(crate) fn delta_view(bytes: &[u8]) -> Result<DeltaSnapshotView<'_>, TerminalError> {
+    let preflight = preflight_a(bytes)?;
+    preflight_b(bytes, &preflight)?;
+    if !matches!(preflight.version, SnapshotVersion::V2_22 { .. }) {
+        return Err(TerminalError::IncompatibleSnapshot);
+    }
+    let mut sections = Vec::new();
+    sections
+        .try_reserve_exact(MAX_KNOWN_SECTIONS)
+        .map_err(|_| TerminalError::LimitExceeded)?;
+    for desc in preflight.descs.iter().flatten() {
+        sections.push((desc.tag, &bytes[desc.offset..desc.offset + desc.length]));
+    }
+    let sequence = scan_core(section(bytes, &preflight, CORE_STATE)?, preflight.version)?.sequence;
+    Ok(DeltaSnapshotView {
+        envelope: &bytes[..HEADER_SIZE + sections.len() * DIRECTORY_ENTRY_SIZE],
+        sections,
+        sequence,
+        width_profile: preflight.version.width_profile(),
+        output_profile: if preflight.version.has_standalone_c1_output_profile() {
+            OutputProfile::Utf8WithStandaloneC1
+        } else {
+            OutputProfile::Utf8
+        },
+    })
+}
+
+pub(crate) struct DeltaSnapshotView<'a> {
+    pub envelope: &'a [u8],
+    pub sections: Vec<(u32, &'a [u8])>,
+    pub sequence: u64,
+    pub width_profile: crate::WidthProfile,
+    pub output_profile: OutputProfile,
 }
 
 struct Preflight {
@@ -1894,7 +2590,14 @@ impl GraphemeWidths {
 }
 
 fn preflight_a(bytes: &[u8]) -> Result<Preflight, TerminalError> {
-    if bytes.len() > MAX_SNAPSHOT_BYTES {
+    let graphics_version = bytes.get(10..12) == Some(&MINOR_V2_22.to_le_bytes());
+    if bytes.len()
+        > if graphics_version {
+            crate::MAX_GRAPHICS_SNAPSHOT_BYTES
+        } else {
+            MAX_SNAPSHOT_BYTES
+        }
+    {
         return Err(TerminalError::LimitExceeded);
     }
     if bytes.len() < HEADER_SIZE {
@@ -1925,6 +2628,18 @@ fn preflight_a(bytes: &[u8]) -> Result<Preflight, TerminalError> {
                 | MINOR_V2_8
                 | MINOR_V2_9
                 | MINOR_V2_10
+                | MINOR_V2_11
+                | MINOR_V2_12
+                | MINOR_V2_13
+                | MINOR_V2_14
+                | MINOR_V2_15
+                | MINOR_V2_16
+                | MINOR_V2_17
+                | MINOR_V2_18
+                | MINOR_V2_19
+                | MINOR_V2_20
+                | MINOR_V2_21
+                | MINOR_V2_22
         )
     {
         return Err(TerminalError::IncompatibleSnapshot);
@@ -1941,11 +2656,14 @@ fn preflight_a(bytes: &[u8]) -> Result<Preflight, TerminalError> {
         return Err(TerminalError::MalformedSnapshot);
     }
     let count = header.u32()? as usize;
-    if !matches!(count, SECTION_COUNT | SECTION_COUNT_V2_6) || count > MAX_SECTIONS {
+    if !(SECTION_COUNT..=MAX_KNOWN_SECTIONS).contains(&count) || count > MAX_SECTIONS {
         return Err(TerminalError::IncompatibleSnapshot);
     }
-    if header.u32()? != 1
-        || header.u32()? != u32::from(WIDTH_PROFILE_VERSION)
+    if header.u32()? != 1 {
+        return Err(TerminalError::IncompatibleSnapshot);
+    }
+    let declared_width = header.u32()?;
+    if !matches!(declared_width, 1 | 2)
         || header.u32()? != 1
         || header.u32()? != 1
         || header.u32()? != 1
@@ -1953,7 +2671,210 @@ fn preflight_a(bytes: &[u8]) -> Result<Preflight, TerminalError> {
         return Err(TerminalError::IncompatibleSnapshot);
     }
     let features = u128::from(header.u64()?) | (u128::from(header.u64()?) << 64);
+    if declared_width
+        != if features & UNICODE16_FEATURE != 0 {
+            2
+        } else {
+            1
+        }
+    {
+        return Err(TerminalError::IncompatibleSnapshot);
+    }
     let version = match (minor, features) {
+        (MINOR_V2_22, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE
+                    | COLOR_EXTENSIONS_FEATURE
+                    | TRADITIONAL_MODES_FEATURE
+                    | MACROS_FEATURE
+                    | PAGES_FEATURE
+                    | HOST_GEOMETRY_FEATURE
+                    | HOST_THEME_FEATURE
+                    | SHELL_INTEGRATION_FEATURE
+                    | HOST_SIGNALS_FEATURE
+                    | GRAPHICS_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & GRAPHICS_FEATURE != 0
+                && features & HISTORY_ANCHORS_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_22 { features }
+        }
+        (MINOR_V2_21, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE
+                    | COLOR_EXTENSIONS_FEATURE
+                    | TRADITIONAL_MODES_FEATURE
+                    | MACROS_FEATURE
+                    | PAGES_FEATURE
+                    | HOST_GEOMETRY_FEATURE
+                    | HOST_THEME_FEATURE
+                    | SHELL_INTEGRATION_FEATURE
+                    | HOST_SIGNALS_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & HOST_SIGNALS_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_21 { features }
+        }
+        (MINOR_V2_20, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE
+                    | COLOR_EXTENSIONS_FEATURE
+                    | TRADITIONAL_MODES_FEATURE
+                    | MACROS_FEATURE
+                    | PAGES_FEATURE
+                    | HOST_GEOMETRY_FEATURE
+                    | HOST_THEME_FEATURE
+                    | SHELL_INTEGRATION_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & SHELL_INTEGRATION_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_20 { features }
+        }
+        (MINOR_V2_19, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE
+                    | COLOR_EXTENSIONS_FEATURE
+                    | TRADITIONAL_MODES_FEATURE
+                    | MACROS_FEATURE
+                    | PAGES_FEATURE
+                    | HOST_GEOMETRY_FEATURE
+                    | HOST_THEME_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & HOST_THEME_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_19 { features }
+        }
+        (MINOR_V2_18, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE
+                    | COLOR_EXTENSIONS_FEATURE
+                    | TRADITIONAL_MODES_FEATURE
+                    | MACROS_FEATURE
+                    | PAGES_FEATURE
+                    | HOST_GEOMETRY_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & HOST_GEOMETRY_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_18 { features }
+        }
+        (MINOR_V2_17, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE
+                    | COLOR_EXTENSIONS_FEATURE
+                    | TRADITIONAL_MODES_FEATURE
+                    | MACROS_FEATURE
+                    | PAGES_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & PAGES_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_17 { features }
+        }
+        (MINOR_V2_16, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE
+                    | COLOR_EXTENSIONS_FEATURE
+                    | TRADITIONAL_MODES_FEATURE
+                    | MACROS_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & MACROS_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_16 { features }
+        }
+        (MINOR_V2_15, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE
+                    | COLOR_EXTENSIONS_FEATURE
+                    | TRADITIONAL_MODES_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & TRADITIONAL_MODES_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_15 { features }
+        }
+        (MINOR_V2_14, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE
+                    | COLOR_EXTENSIONS_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & COLOR_EXTENSIONS_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_14 { features }
+        }
+        (MINOR_V2_13, features)
+            if features
+                & !(OPTIONAL_FEATURES_V2_11
+                    | NEW_FEATURES_V2_11
+                    | UNICODE16_FEATURE
+                    | LINE_RENDITION_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & LINE_RENDITION_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_13 { features }
+        }
+        (MINOR_V2_12, features)
+            if features & !(OPTIONAL_FEATURES_V2_11 | NEW_FEATURES_V2_11 | UNICODE16_FEATURE)
+                == REQUIRED_FEATURES_V2_0
+                && features & UNICODE16_FEATURE != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_12 { features }
+        }
+        (MINOR_V2_11, features)
+            if features & !(OPTIONAL_FEATURES_V2_11 | NEW_FEATURES_V2_11)
+                == REQUIRED_FEATURES_V2_0
+                && features & NEW_FEATURES_V2_11 != 0
+                && (features & RETAINED_PRIMARY_SCROLLBACK_FEATURE == 0
+                    || features & HISTORY_ANCHORS_FEATURE != 0) =>
+        {
+            SnapshotVersion::V2_11 { features }
+        }
         (MINOR_V2_0, REQUIRED_FEATURES_V2_0) => SnapshotVersion::V2_0,
         (MINOR_V2_1, REQUIRED_FEATURES_V2_1) => SnapshotVersion::V2_1,
         (MINOR_V2_2, REQUIRED_FEATURES_V2_2) => SnapshotVersion::V2_2 { history: false },
@@ -2061,7 +2982,7 @@ fn preflight_a(bytes: &[u8]) -> Result<Preflight, TerminalError> {
     }
     let mut descs = [None; MAX_SECTIONS];
     let mut previous = 0;
-    for (index, &expected_tag) in version.tags().iter().enumerate() {
+    for (index, expected_tag) in version.tags().enumerate() {
         let base = HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE;
         let mut reader = Reader::new(&bytes[base..base + DIRECTORY_ENTRY_SIZE]);
         let tag = reader.u32()?;
@@ -2144,7 +3065,75 @@ fn first_u32(bytes: &[u8]) -> Result<u32, TerminalError> {
     Reader::new(bytes).u32()
 }
 
+fn decode_host_geometry(
+    bytes: &[u8],
+    p: &Preflight,
+) -> Result<crate::HostGeometryV1, TerminalError> {
+    if p.version.required_features() & HOST_GEOMETRY_FEATURE == 0 {
+        return Ok(crate::HostGeometryV1::default());
+    }
+    if logical_count(p, HOST_GEOMETRY_STATE)? != 1 {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    let value = crate::HostGeometryV1::decode(section(bytes, p, HOST_GEOMETRY_STATE)?)
+        .map_err(|_| TerminalError::MalformedSnapshot)?;
+    if value == crate::HostGeometryV1::default() {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    Ok(value)
+}
+
+fn decode_host_signals(bytes: &[u8], p: &Preflight) -> Result<crate::HostSignalsV1, TerminalError> {
+    if p.version.required_features() & HOST_SIGNALS_FEATURE == 0 {
+        return Ok(crate::HostSignalsV1::default());
+    }
+    if logical_count(p, HOST_SIGNALS_STATE)? != 1 {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    let value = crate::HostSignalsV1::decode(section(bytes, p, HOST_SIGNALS_STATE)?)?;
+    if value == crate::HostSignalsV1::default() {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    Ok(value)
+}
+
+fn decode_shell_state(
+    bytes: &[u8],
+    p: &Preflight,
+) -> Result<crate::ShellIntegration, TerminalError> {
+    if p.version.required_features() & SHELL_INTEGRATION_FEATURE == 0 {
+        return Ok(crate::ShellIntegration::default());
+    }
+    if logical_count(p, SHELL_INTEGRATION_STATE)? != 1 {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    let sequence = scan_core(section(bytes, p, CORE_STATE)?, p.version)?.sequence;
+    let value =
+        crate::ShellIntegration::decode(section(bytes, p, SHELL_INTEGRATION_STATE)?, sequence)?;
+    if !value.has_state() {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    Ok(value)
+}
+
 fn preflight_b(bytes: &[u8], preflight: &Preflight) -> Result<(), TerminalError> {
+    decode_host_signals(bytes, preflight)?;
+    if preflight.version.required_features() & SHELL_INTEGRATION_FEATURE != 0 {
+        let sequence =
+            scan_core(section(bytes, preflight, CORE_STATE)?, preflight.version)?.sequence;
+        if logical_count(preflight, SHELL_INTEGRATION_STATE)? != 1
+            || !crate::ShellIntegration::validate(
+                section(bytes, preflight, SHELL_INTEGRATION_STATE)?,
+                sequence,
+            )?
+        {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+    }
+    decode_host_geometry(bytes, preflight)?;
+    if preflight.version.required_features() & MACROS_FEATURE != 0 {
+        scan_macros(bytes, preflight)?;
+    }
     let core = scan_core(section(bytes, preflight, CORE_STATE)?, preflight.version)?;
     let columns = core.columns;
     let rows = core.rows;
@@ -2161,13 +3150,29 @@ fn preflight_b(bytes: &[u8], preflight: &Preflight) -> Result<(), TerminalError>
             logical_count(preflight, KEYBOARD_PROTOCOL_STATE)?,
         )?;
     }
-    let charsets = decode_charsets(section(bytes, preflight, CHARSET_STATE)?, preflight.version)?;
-    validate_national_replacement_profile(preflight.version, modes, charsets)?;
+    let (charsets, preference) =
+        decode_charsets(section(bytes, preflight, CHARSET_STATE)?, preflight.version)?;
+    validate_national_replacement_profile(preflight.version, modes, charsets, preference)?;
     let hyperlink_count =
         OscState::snapshot_v2_hyperlink_count(section(bytes, preflight, OSC_STATE)?)
             .map_err(map_osc_import_error)?;
     let mut widths = GraphemeWidths::new();
-    let grapheme_count = scan_graphemes(section(bytes, preflight, GRAPHEME_TABLE)?, &mut widths)?;
+    let resources = if preflight.version.required_features() & GRAPHICS_FEATURE != 0 {
+        if logical_count(preflight, GRAPHICS_STATE)? != 1 {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+        Some(crate::graphics_state::GraphicsState::inspect_resources(
+            section(bytes, preflight, GRAPHICS_STATE)?,
+        )?)
+    } else {
+        None
+    };
+    let grapheme_count = scan_graphemes(
+        section(bytes, preflight, GRAPHEME_TABLE)?,
+        &mut widths,
+        preflight.version,
+        resources.as_ref(),
+    )?;
     let mut grapheme_uses = GraphemeUses::new();
     if let Some(id) = core.repeat_grapheme_id {
         if id as usize >= grapheme_count {
@@ -2180,6 +3185,11 @@ fn preflight_b(bytes: &[u8], preflight: &Preflight) -> Result<(), TerminalError>
         preflight.version,
     )?;
     let mut rendition_uses = RenditionUses::new();
+    if preflight.version.has_sgr_stack() {
+        for (_, id) in scan_sgr_stack(bytes, preflight, rendition_count)? {
+            rendition_uses.set(id as usize);
+        }
+    }
     if grapheme_count as u32 != logical_count(preflight, GRAPHEME_TABLE)?
         || rendition_count as u32 != logical_count(preflight, RENDITION_TABLE)?
     {
@@ -2236,24 +3246,57 @@ fn preflight_b(bytes: &[u8], preflight: &Preflight) -> Result<(), TerminalError>
         false,
         core.sequence,
     )?;
+    let mut active_meta = if core.active_alternate {
+        alternate
+    } else {
+        primary
+    };
+    if preflight.version.required_features() & PAGES_FEATURE != 0 {
+        let pages = page_records(bytes, preflight)?;
+        let mut cells = 0usize;
+        for (id, meta_bytes, rows_bytes) in pages.entries {
+            let meta = scan_meta(meta_bytes, rendition_count, preflight.version, false)?;
+            if meta.columns != columns || meta.visible_rows != rows {
+                return Err(TerminalError::MalformedSnapshot);
+            }
+            cells += meta.columns as usize * meta.visible_rows as usize;
+            if cells > crate::pages::MAX_EXTRA_CELLS {
+                return Err(TerminalError::MalformedSnapshot);
+            }
+            row_tables.rendition_uses.set(meta.attributes_id as usize);
+            row_tables
+                .rendition_uses
+                .set(meta.saved_attributes_id as usize);
+            scan_rows(
+                rows_bytes,
+                meta,
+                &mut row_tables,
+                preflight.version,
+                false,
+                core.sequence,
+            )?;
+            if !core.active_alternate && id == pages.active {
+                active_meta = meta;
+            }
+        }
+    } else if grapheme_count > 2 * MAX_CELLS + 2
+        || rendition_count > 2 * MAX_CELLS + 5 + SGR_STACK_CAPACITY
+    {
+        return Err(TerminalError::MalformedSnapshot);
+    }
     if alternate.columns != columns
         || alternate.visible_rows != rows
         || (!core.active_alternate && (primary.columns != columns || primary.visible_rows != rows))
     {
         return Err(TerminalError::MalformedSnapshot);
     }
-    validate_active_meta_wrap_state(
-        if core.active_alternate {
-            alternate
-        } else {
-            primary
-        },
-        modes,
-        margins,
-    )?;
+    if !preflight.version.has_line_renditions() {
+        validate_active_meta_wrap_state(active_meta, modes, margins)?;
+    }
     if (preflight.version.has_retained_primary_scrollback()
         || preflight.version.has_repeat_source()
-        || preflight.version.has_cursor_style())
+        || preflight.version.has_cursor_style()
+        || preflight.version.required_features() & GRAPHICS_FEATURE != 0)
         && (1..grapheme_count).any(|id| !grapheme_uses.get(id))
     {
         return Err(TerminalError::MalformedSnapshot);
@@ -2264,6 +3307,141 @@ fn preflight_b(bytes: &[u8], preflight: &Preflight) -> Result<(), TerminalError>
         return Err(TerminalError::MalformedSnapshot);
     }
     Ok(())
+}
+
+struct PageRecords<'a> {
+    active: u8,
+    visible: u8,
+    saved: u8,
+    coupled: bool,
+    entries: Vec<(u8, &'a [u8], &'a [u8])>,
+}
+
+fn page_records<'a>(
+    bytes: &'a [u8],
+    preflight: &Preflight,
+) -> Result<PageRecords<'a>, TerminalError> {
+    let bytes = section(bytes, preflight, PAGES_STATE)?;
+    if bytes.len() > MAX_PAGES_SECTION_BYTES {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    let mut reader = Reader::new(bytes);
+    let active = reader.u8()?;
+    let visible = reader.u8()?;
+    let saved = reader.u8()?;
+    let coupled = decode_bool(reader.u8()?)?;
+    let count = reader.u32()?;
+    if count >= u32::from(crate::pages::MAX_PAGES)
+        || count != logical_count(preflight, PAGES_STATE)?
+        || reader.u64()? != 0
+    {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut previous = 1;
+    for _ in 0..count {
+        let id = reader.u32()?;
+        if id <= previous || id > u32::from(crate::pages::MAX_PAGES) {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+        let length = reader.u32()? as usize;
+        let meta = reader.take(64)?;
+        let rows = reader.take(length)?;
+        entries.push((id as u8, meta, rows));
+        previous = id;
+    }
+    for id in [active, visible, saved] {
+        if id != 1 && !entries.iter().any(|(page, _, _)| *page == id) {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+    }
+    if !reader.is_empty()
+        || (coupled && active != visible)
+        || (coupled && count == 0 && active == 1 && visible == 1 && saved == 1)
+    {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    Ok(PageRecords {
+        active,
+        visible,
+        saved,
+        coupled,
+        entries,
+    })
+}
+
+fn scan_macros<'a>(
+    bytes: &'a [u8],
+    p: &Preflight,
+) -> Result<Vec<(usize, &'a [u8])>, TerminalError> {
+    let payload = section(bytes, p, MACROS_STATE)?;
+    if payload.len() > crate::macros::MAX_SNAPSHOT_BYTES {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    let mut reader = Reader::new(payload);
+    let count = reader.u32()? as usize;
+    let total = reader.u32()? as usize;
+    if !(1..=crate::macros::CAPACITY).contains(&count)
+        || count as u32 != logical_count(p, MACROS_STATE)?
+        || total > crate::macros::MAX_BYTES
+        || payload.len() != 8 + count * 8 + total
+    {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(count)
+        .map_err(|_| TerminalError::LimitExceeded)?;
+    let mut previous = None;
+    let mut used = 0usize;
+    for _ in 0..count {
+        let id = reader.u32()? as usize;
+        let length = reader.u32()? as usize;
+        if id >= crate::macros::CAPACITY
+            || previous.is_some_and(|v| v >= id)
+            || length == 0
+            || length > total - used
+        {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+        result.push((id, reader.take(length)?));
+        used += length;
+        previous = Some(id);
+    }
+    if used != total {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    Ok(result)
+}
+
+fn scan_sgr_stack(
+    bytes: &[u8],
+    p: &Preflight,
+    rendition_count: usize,
+) -> Result<impl Iterator<Item = (u32, u32)>, TerminalError> {
+    let bytes = section(bytes, p, SGR_STACK_STATE)?;
+    let mut reader = Reader::new(bytes);
+    let count = reader.u32()? as usize;
+    require_zero(reader.u32()?)?;
+    if !(1..=SGR_STACK_CAPACITY).contains(&count)
+        || count as u32 != logical_count(p, SGR_STACK_STATE)?
+        || bytes.len() != 8 + count * 8
+    {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    let mut entries = [(0, 0); SGR_STACK_CAPACITY];
+    for entry in &mut entries[..count] {
+        let mask = reader.u32()?;
+        let id = reader.u32()?;
+        if mask & !SGR_STACK_SELECTORS != 0
+            || (mask & 1 != 0 && mask != 1)
+            || id as usize >= rendition_count
+        {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+        *entry = (mask, id);
+    }
+    Ok(entries.into_iter().take(count))
 }
 
 fn scan_core(bytes: &[u8], version: SnapshotVersion) -> Result<CoreState, TerminalError> {
@@ -2369,6 +3547,27 @@ fn decode_modes(bytes: &[u8], version: SnapshotVersion) -> Result<ModeState, Ter
                 result.modify_other_keys = value;
                 true
             }
+            4 if enabled && version.required_features() & TRADITIONAL_MODES_FEATURE != 0 => {
+                match mode {
+                    1 => {
+                        result.vt52 = true;
+                        true
+                    }
+                    5 => {
+                        result.send_c1 = true;
+                        true
+                    }
+                    2 => {
+                        result.iso2022 = true;
+                        true
+                    }
+                    3 | 4 if result.receive_c1 == 0 => {
+                        result.receive_c1 = (mode - 2) as u8;
+                        true
+                    }
+                    _ => false,
+                }
+            }
             _ => false,
         };
         if !accepted || (!enabled && !(namespace == 1 && mode == 7)) {
@@ -2377,6 +3576,9 @@ fn decode_modes(bytes: &[u8], version: SnapshotVersion) -> Result<ModeState, Ter
         previous = Some(key);
     }
     if result.win32_input_mode != version.has_win32_input_mode() {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    if result.alternate_scroll != version.has_alternate_scroll() {
         return Err(TerminalError::MalformedSnapshot);
     }
     if (result.grapheme_clustering || result.color_scheme_reporting)
@@ -2461,10 +3663,20 @@ fn validate_active_screen_wrap_state(
 ) -> Result<(), TerminalError> {
     if (screen.wrap_pending
         && screen.cursor_column
-            != expected_wrap_column(screen.cursor_row, screen.columns, modes, margins))
+            != expected_wrap_column(
+                screen.cursor_row,
+                screen.line_columns(screen.cursor_row),
+                modes,
+                margins,
+            ))
         || (screen.saved.wrap_pending
             && screen.saved.column
-                != expected_wrap_column(screen.saved.row, screen.columns, modes, margins))
+                != expected_wrap_column(
+                    screen.saved.row,
+                    screen.line_columns(screen.saved.row),
+                    modes,
+                    margins,
+                ))
     {
         return Err(TerminalError::MalformedSnapshot);
     }
@@ -2524,26 +3736,147 @@ fn decode_keyboard_protocol_state(
 fn decode_charsets(
     bytes: &[u8],
     version: SnapshotVersion,
-) -> Result<(CharsetState, CharsetState, CharsetState), TerminalError> {
-    if bytes.len() != 44 {
+) -> Result<
+    (
+        (CharsetState, CharsetState, CharsetState),
+        CharsetDesignation,
+    ),
+    TerminalError,
+> {
+    let extended = version.required_features() & TRADITIONAL_MODES_FEATURE != 0;
+    let graphics = version.required_features() & GRAPHICS_FEATURE != 0;
+    let record_size = if graphics { 24 } else { 12 };
+    if bytes.len() != 8 + 3 * record_size + if extended { 8 } else { 0 } {
         return Err(TerminalError::MalformedSnapshot);
     }
     let mut r = Reader::new(bytes);
-    if r.u32()? != 3 || r.u32()? != 12 {
+    if r.u32()? != 3 || r.u32()? as usize != record_size {
         return Err(TerminalError::MalformedSnapshot);
     }
-    Ok((
+    let charsets = (
         decode_charset(&mut r, version)?,
         decode_charset(&mut r, version)?,
         decode_charset(&mut r, version)?,
-    ))
+    );
+    let preference = if extended {
+        let value = if graphics {
+            decode_raw_designation(&mut r)?
+        } else {
+            let value = decode_designation(r.u8()?, version)?;
+            require_zero(r.u8()?)?;
+            require_zero(r.u16()?)?;
+            value
+        };
+        require_zero(r.u32()?)?;
+        if value.charset == GraphicCharset::UserPreferred {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+        value
+    } else {
+        CharsetDesignation::LATIN1
+    };
+    Ok((charsets, preference))
+}
+
+fn decode_raw_designation(r: &mut Reader<'_>) -> Result<CharsetDesignation, TerminalError> {
+    let size = match r.u8()? {
+        94 => CharsetSize::Characters94,
+        96 => CharsetSize::Characters96,
+        _ => return Err(TerminalError::MalformedSnapshot),
+    };
+    let bytes = r.take(3)?;
+    let length = bytes.iter().position(|&byte| byte == 0).unwrap_or(3);
+    if bytes[length..].iter().any(|&byte| byte != 0) {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    let (&final_byte, prefix) = bytes[..length]
+        .split_last()
+        .ok_or(TerminalError::MalformedSnapshot)?;
+    CharsetDesignation::decode_with_soft(size, prefix, final_byte, true)
+        .map_err(|_| TerminalError::MalformedSnapshot)
+}
+
+fn decode_designation(
+    designator: u8,
+    version: SnapshotVersion,
+) -> Result<CharsetDesignation, TerminalError> {
+    let (size, prefix, final_byte) = match designator {
+        15..=30 if version.required_features() & TRADITIONAL_MODES_FEATURE != 0 => {
+            let set = crate::legacy_charsets::ExtendedCharset::from_id(designator - 15)
+                .ok_or(TerminalError::MalformedSnapshot)?;
+            let (&final_byte, prefix) = set.designator().as_bytes().split_last().unwrap();
+            return CharsetDesignation::decode_with_prefix(set.size(), prefix, final_byte)
+                .map_err(|_| TerminalError::MalformedSnapshot);
+        }
+        31 | 32 if version.required_features() & TRADITIONAL_MODES_FEATURE != 0 => {
+            return CharsetDesignation::decode_with_prefix(
+                if designator == 31 {
+                    CharsetSize::Characters94
+                } else {
+                    CharsetSize::Characters96
+                },
+                b"",
+                b'<',
+            )
+            .map_err(|_| TerminalError::MalformedSnapshot);
+        }
+        0 => (CharsetSize::Characters94, &b""[..], b'B'),
+        1 => (CharsetSize::Characters94, &b""[..], b'0'),
+        2 => (CharsetSize::Characters96, &b""[..], b'A'),
+        3 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'A')
+        }
+        4 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'4')
+        }
+        5 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'5')
+        }
+        6 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'R')
+        }
+        7 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'Q')
+        }
+        8 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'K')
+        }
+        9 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'Y')
+        }
+        10 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'E')
+        }
+        11 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b"%"[..], b'6')
+        }
+        12 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'Z')
+        }
+        13 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'7')
+        }
+        14 if version.has_national_replacement_charset() => {
+            (CharsetSize::Characters94, &b""[..], b'=')
+        }
+        _ => return Err(TerminalError::MalformedSnapshot),
+    };
+    CharsetDesignation::decode_with_prefix(size, prefix, final_byte)
+        .map_err(|_| TerminalError::MalformedSnapshot)
 }
 
 fn decode_charset(
     r: &mut Reader<'_>,
     version: SnapshotVersion,
 ) -> Result<CharsetState, TerminalError> {
-    let designators = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
+    let mut designators = [CharsetDesignation::LATIN1; 4];
+    for designation in &mut designators {
+        *designation = if version.required_features() & GRAPHICS_FEATURE != 0 {
+            decode_raw_designation(r)?
+        } else {
+            decode_designation(r.u8()?, version)?
+        };
+    }
     let gl = r.u8()?;
     let gr = r.u8()?;
     let shift = r.u8()?;
@@ -2559,51 +3892,7 @@ fn decode_charset(
     .into_iter()
     .zip(designators)
     {
-        let (size, prefix, final_byte) = match designator {
-            0 => (CharsetSize::Characters94, &b""[..], b'B'),
-            1 => (CharsetSize::Characters94, &b""[..], b'0'),
-            2 => (CharsetSize::Characters96, &b""[..], b'A'),
-            3 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'A')
-            }
-            4 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'4')
-            }
-            5 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'5')
-            }
-            6 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'R')
-            }
-            7 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'Q')
-            }
-            8 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'K')
-            }
-            9 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'Y')
-            }
-            10 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'E')
-            }
-            11 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b"%"[..], b'6')
-            }
-            12 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'Z')
-            }
-            13 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'7')
-            }
-            14 if version.has_national_replacement_charset() => {
-                (CharsetSize::Characters94, &b""[..], b'=')
-            }
-            _ => return Err(TerminalError::MalformedSnapshot),
-        };
-        state
-            .designate_with_prefix(register, size, prefix, final_byte)
-            .map_err(|_| TerminalError::MalformedSnapshot)?;
+        state.set_designation(register, designator);
     }
     match gl {
         0 => state.shift_in(),
@@ -2632,48 +3921,69 @@ fn validate_national_replacement_profile(
     version: SnapshotVersion,
     modes: ModeState,
     charsets: (CharsetState, CharsetState, CharsetState),
+    preference: CharsetDesignation,
 ) -> Result<(), TerminalError> {
     let state_uses_national_replacement = modes.national_replacement_character_set_mode
         || charset_has_national_replacement(charsets.0)
         || charset_has_national_replacement(charsets.1)
-        || charset_has_national_replacement(charsets.2);
+        || charset_has_national_replacement(charsets.2)
+        || matches!(preference.charset, GraphicCharset::NationalReplacement(_));
+    let traditional = modes.has_traditional_modes()
+        || charsets.0.has_extended()
+        || charsets.1.has_extended()
+        || charsets.2.has_extended()
+        || preference != CharsetDesignation::LATIN1;
+    if traditional != (version.required_features() & TRADITIONAL_MODES_FEATURE != 0) {
+        return Err(TerminalError::MalformedSnapshot);
+    }
     if state_uses_national_replacement != version.has_national_replacement_charset() {
         return Err(TerminalError::MalformedSnapshot);
     }
     Ok(())
 }
 
-fn scan_graphemes(bytes: &[u8], widths: &mut GraphemeWidths) -> Result<usize, TerminalError> {
+fn scan_graphemes(
+    bytes: &[u8],
+    widths: &mut GraphemeWidths,
+    version: SnapshotVersion,
+    resources: Option<&crate::graphics_resources::ResourceFrame<'_>>,
+) -> Result<usize, TerminalError> {
     let mut r = Reader::new(bytes);
     let count = r.u32()? as usize;
     require_zero(r.u32()?)?;
     if count == 0 || count > MAX_GRAPHEME_TABLE_ENTRIES {
         return Err(TerminalError::MalformedSnapshot);
     }
-    let mut previous: Option<&[u8]> = None;
+    let mut previous: Option<GraphemeRef<'_>> = None;
     for index in 0..count {
-        let length = r.u16()? as usize;
-        let width = r.u8()?;
-        require_zero(r.u8()?)?;
-        if length == 0 || length > MAX_GRAPHEME_BYTES || !matches!(width, 1 | 2) {
-            return Err(TerminalError::MalformedSnapshot);
-        }
-        let text = r.take(length)?;
-        let string = std::str::from_utf8(text).map_err(|_| TerminalError::MalformedSnapshot)?;
-        let mut chars = string.chars();
-        let character = chars.next().ok_or(TerminalError::MalformedSnapshot)?;
-        let suffix = chars.as_str();
-        if grapheme_width(character, suffix) != width
-            || character.is_control()
-            || !valid_grapheme_suffix(suffix)
-            || previous.is_some_and(|v| v >= text)
-            || (index == 0 && (text != b" " || width != 1))
+        let value = read_grapheme(&mut r, version)?;
+        if previous.is_some_and(|previous| previous.compare(value) != Ordering::Less)
+            || (index == 0
+                && (value.character != ' '
+                    || !value.combining.is_empty()
+                    || value.width != 1
+                    || value.glyph.is_some()))
         {
             return Err(TerminalError::MalformedSnapshot);
         }
-        widths.set(index, width);
-        previous = Some(text);
-        r.zero_padding_to4()?;
+        if let Some(glyph) = value.glyph {
+            let (width, height, format) = resources
+                .and_then(|resources| resources.metadata(glyph.resource))
+                .ok_or(TerminalError::MalformedSnapshot)?;
+            if format != crate::graphics_resources::ImageFormat::Alpha8
+                || glyph.width == 0
+                || glyph.height == 0
+                || glyph.height > height
+                || glyph
+                    .x
+                    .checked_add(glyph.width)
+                    .is_none_or(|right| right > width)
+            {
+                return Err(TerminalError::MalformedSnapshot);
+            }
+        }
+        widths.set(index, value.width);
+        previous = Some(value);
     }
     if !r.is_empty() {
         return Err(TerminalError::MalformedSnapshot);
@@ -2681,21 +3991,43 @@ fn scan_graphemes(bytes: &[u8], widths: &mut GraphemeWidths) -> Result<usize, Te
     Ok(count)
 }
 
-fn valid_grapheme_suffix(text: &str) -> bool {
-    let mut joined = false;
-    for character in text.chars() {
-        if character.is_control() && character != '\u{200d}' {
-            return false;
-        }
-        if scalar_width(character) == 0 {
-            joined = character == '\u{200d}';
-        } else if joined && scalar_width(character) == 2 {
-            joined = false;
-        } else {
-            return false;
-        }
+fn read_grapheme<'a>(
+    r: &mut Reader<'a>,
+    version: SnapshotVersion,
+) -> Result<GraphemeRef<'a>, TerminalError> {
+    let length = r.u16()? as usize;
+    let width = r.u8()?;
+    let glyph = match r.u8()? {
+        0 => None,
+        1 if version.required_features() & GRAPHICS_FEATURE != 0 => Some(GlyphReference {
+            resource: r.u64()?,
+            x: r.u32()?,
+            width: r.u32()?,
+            height: r.u32()?,
+        }),
+        _ => return Err(TerminalError::MalformedSnapshot),
+    };
+    let profile = version.width_profile();
+    if length == 0 || length > profile.max_grapheme_bytes() || !matches!(width, 1 | 2) {
+        return Err(TerminalError::MalformedSnapshot);
     }
-    true
+    let text =
+        std::str::from_utf8(r.take(length)?).map_err(|_| TerminalError::MalformedSnapshot)?;
+    let mut chars = text.chars();
+    let character = chars.next().ok_or(TerminalError::MalformedSnapshot)?;
+    let combining = chars.as_str();
+    if !profile.valid_grapheme(character, combining, width)
+        || (glyph.is_some() && (width != 1 || !combining.is_empty()))
+    {
+        return Err(TerminalError::MalformedSnapshot);
+    }
+    r.zero_padding_to4()?;
+    Ok(GraphemeRef {
+        character,
+        combining,
+        width,
+        glyph,
+    })
 }
 
 fn scan_renditions(bytes: &[u8], version: SnapshotVersion) -> Result<usize, TerminalError> {
@@ -2864,7 +4196,10 @@ fn scan_meta(
         return Err(TerminalError::MalformedSnapshot);
     }
     if version.has_history() {
-        if (primary && !(1..=u64::from(MAX_HISTORY_ROWS)).contains(&meta.requested_history_rows))
+        let minimum_history = u64::from(version.required_features() & GRAPHICS_FEATURE == 0);
+        if (primary
+            && !(minimum_history..=u64::from(MAX_HISTORY_ROWS))
+                .contains(&meta.requested_history_rows))
             || (!primary && meta.requested_history_rows != 0)
             || meta.next_logical_line_id == 0
         {
@@ -2902,11 +4237,17 @@ fn scan_rows(
         let sealed_revision = if retained_primary { r.u64()? } else { 0 };
         let soft_wrapped = flags & 1 != 0;
         let head_truncated = flags & 2 != 0;
+        let rendition_flags = if version.has_line_renditions() { 12 } else { 0 };
+        let line_rendition = crate::LineRendition::from_wire((flags & rendition_flags) >> 2)
+            .ok_or(TerminalError::MalformedSnapshot)?;
         if sealed_revision > checkpoint_sequence
-            || meaningful > meta.columns
+            || meaningful > line_rendition.columns(meta.columns)
+            || (line_rendition != crate::LineRendition::SingleWidth && soft_wrapped)
+            || (line_rendition != crate::LineRendition::SingleWidth
+                && previous_anchor.is_some_and(|(_, _, _, wrapped, _)| wrapped))
             || (row + 1 == rows && soft_wrapped)
             || if version.has_history() {
-                flags & !3 != 0
+                flags & !(3 | rendition_flags) != 0
                     || logical_line_id >= meta.next_logical_line_id
                     || (row != 0 && head_truncated)
                     || match previous_anchor {
@@ -2926,7 +4267,9 @@ fn scan_rows(
                         Some((_, _, _, false, _)) => logical_cell_offset != 0,
                     }
             } else {
-                logical_line_id != 0 || logical_cell_offset != 0 || flags & !1 != 0
+                logical_line_id != 0
+                    || logical_cell_offset != 0
+                    || flags & !(1 | rendition_flags) != 0
             }
         {
             return Err(TerminalError::MalformedSnapshot);
@@ -2938,6 +4281,16 @@ fn scan_rows(
             soft_wrapped,
             sealed_revision,
         ));
+        for (cursor_row, cursor_column) in [
+            (meta.cursor_row, meta.cursor_column),
+            (meta.saved_row, meta.saved_column),
+        ] {
+            if meta.viewport_top + cursor_row == row
+                && cursor_column >= line_rendition.columns(meta.columns)
+            {
+                return Err(TerminalError::MalformedSnapshot);
+            }
+        }
         let mut physical = 0_u64;
         let mut previous = None;
         for _ in 0..runs {
@@ -3019,13 +4372,44 @@ fn decode_terminal(bytes: &[u8], p: &Preflight) -> Result<Terminal, TerminalErro
                 KeyboardProtocolStack::default(),
             )
         };
-    let charsets = decode_charsets(section(bytes, p, CHARSET_STATE)?, p.version)?;
-    validate_national_replacement_profile(p.version, modes, charsets)?;
+    let (charsets, user_preferred_charset) =
+        decode_charsets(section(bytes, p, CHARSET_STATE)?, p.version)?;
+    validate_national_replacement_profile(p.version, modes, charsets, user_preferred_charset)?;
     let (charset, main_saved_charset, alternate_saved_charset) = charsets;
-    let osc = OscState::decode_snapshot_v2(section(bytes, p, OSC_STATE)?)
+    let mut osc = OscState::decode_snapshot_v2(section(bytes, p, OSC_STATE)?)
         .map_err(map_osc_import_error)?;
-    let graphemes = decode_graphemes(section(bytes, p, GRAPHEME_TABLE)?)?;
+    if p.version.required_features() & HOST_THEME_FEATURE != 0 {
+        if logical_count(p, HOST_THEME_STATE)? != 1 {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+        osc.restore_theme_state(section(bytes, p, HOST_THEME_STATE)?)?;
+    }
+    if osc.has_extended_colors() != (p.version.required_features() & COLOR_EXTENSIONS_FEATURE != 0)
+    {
+        return Err(TerminalError::IncompatibleSnapshot);
+    }
+    let graphemes = decode_graphemes(section(bytes, p, GRAPHEME_TABLE)?, p.version)?;
     let renditions = decode_renditions(section(bytes, p, RENDITION_TABLE)?, p.version)?;
+    let mut macros = crate::macros::MacroStore::default();
+    if p.version.required_features() & MACROS_FEATURE != 0 {
+        for (id, bytes) in scan_macros(bytes, p)? {
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| TerminalError::LimitExceeded)?;
+            owned.extend_from_slice(bytes);
+            macros.install(id, owned, false)?;
+        }
+    }
+    let mut sgr_stack = SgrStack::default();
+    if p.version.has_sgr_stack() {
+        for (mask, id) in scan_sgr_stack(bytes, p, renditions.len())? {
+            sgr_stack.push(SavedRendition {
+                mask,
+                attributes: renditions[id as usize],
+            });
+        }
+    }
     let main = decode_screen(
         section(bytes, p, PRIMARY_META)?,
         section(bytes, p, PRIMARY_ROWS)?,
@@ -3042,6 +4426,28 @@ fn decode_terminal(bytes: &[u8], p: &Preflight) -> Result<Terminal, TerminalErro
         p.version,
         false,
     )?;
+    let mut pages = crate::pages::PageStore::default();
+    if p.version.required_features() & PAGES_FEATURE != 0 {
+        let records = page_records(bytes, p)?;
+        pages.active = records.active;
+        pages.visible = records.visible;
+        pages.saved = records.saved;
+        pages.coupled = records.coupled;
+        for (id, meta, rows) in records.entries {
+            pages.extra[usize::from(id - 2)] = Some(decode_screen(
+                meta,
+                rows,
+                &graphemes,
+                &renditions,
+                p.version,
+                false,
+            )?);
+        }
+        pages.validate(columns, rows, p.version.width_profile())?;
+        if !pages.has_state() {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+    }
     if main
         .row_metadata
         .iter()
@@ -3066,7 +4472,47 @@ fn decode_terminal(bytes: &[u8], p: &Preflight) -> Result<Terminal, TerminalErro
             character: grapheme.character,
             combining,
             width: grapheme.width,
+            glyph: grapheme.glyph,
         })
+    } else {
+        None
+    };
+    let graphics = if p.version.required_features() & GRAPHICS_FEATURE != 0 {
+        if logical_count(p, GRAPHICS_STATE)? != 1 {
+            return Err(TerminalError::MalformedSnapshot);
+        }
+        Some(crate::graphics_state::GraphicsState::decode_with_admission(
+            section(bytes, p, GRAPHICS_STATE)?,
+            |placements| {
+                for page in 1..=7 {
+                    if !placements
+                        .iter()
+                        .any(|placement| placement.anchor.page == page)
+                    {
+                        continue;
+                    }
+                    let screen = match page {
+                        1 => Some(&main),
+                        7 => Some(&alternate),
+                        _ => pages.extra[usize::from(page - 2)].as_ref(),
+                    }
+                    .ok_or(TerminalError::MalformedSnapshot)?;
+                    let index = crate::terminal_graphics::GraphicsAnchorIndex::new(screen)?;
+                    for placement in placements
+                        .iter()
+                        .filter(|placement| placement.anchor.page == page)
+                    {
+                        if index
+                            .locate(placement.anchor.logical_line, placement.anchor.cell_offset)
+                            .is_none()
+                        {
+                            return Err(TerminalError::MalformedSnapshot);
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )?)
     } else {
         None
     };
@@ -3075,6 +4521,14 @@ fn decode_terminal(bytes: &[u8], p: &Preflight) -> Result<Terminal, TerminalErro
         rows,
         main,
         alternate,
+        pages,
+        host_geometry: decode_host_geometry(bytes, p)?,
+        shell_integration: decode_shell_state(bytes, p)?,
+        host_signals: decode_host_signals(bytes, p)?,
+        graphics,
+        legacy_projection: None,
+        kitty_transfer: crate::kitty_graphics::TransferDecoder::default(),
+        broker_replay: None,
         active_alternate: core.active_alternate,
         cursor_visible: core.cursor_visible,
         cursor_shape: core.cursor_shape,
@@ -3085,6 +4539,7 @@ fn decode_terminal(bytes: &[u8], p: &Preflight) -> Result<Terminal, TerminalErro
         margins,
         tabs,
         charset,
+        user_preferred_charset,
         main_saved_charset,
         alternate_saved_charset,
         osc,
@@ -3100,21 +4555,21 @@ fn decode_terminal(bytes: &[u8], p: &Preflight) -> Result<Terminal, TerminalErro
         utf8: Utf8Decoder::default(),
         string_utf8: StringUtf8Boundary::default(),
         repeat_source,
+        sgr_stack,
+        macros,
+        macro_execution: crate::macros::MacroExecution::default(),
         failed_closed: false,
+        diagnostics: crate::diagnostic::OutputDiagnostics::default(),
     };
-    validate_active_screen_wrap_state(
-        if terminal.active_alternate {
-            &terminal.alternate
-        } else {
-            &terminal.main
-        },
-        terminal.modes,
-        terminal.margins,
-    )?;
+    validate_active_screen_wrap_state(terminal.active_screen(), terminal.modes, terminal.margins)?;
+    terminal.validate_graphics_anchors()?;
     Ok(terminal)
 }
 
-fn decode_graphemes(bytes: &[u8]) -> Result<Vec<GraphemeOwned>, TerminalError> {
+fn decode_graphemes(
+    bytes: &[u8],
+    version: SnapshotVersion,
+) -> Result<Vec<GraphemeOwned>, TerminalError> {
     let mut r = Reader::new(bytes);
     let count = r.u32()? as usize;
     r.u32()?;
@@ -3123,25 +4578,18 @@ fn decode_graphemes(bytes: &[u8]) -> Result<Vec<GraphemeOwned>, TerminalError> {
         .try_reserve_exact(count)
         .map_err(|_| TerminalError::LimitExceeded)?;
     for _ in 0..count {
-        let length = r.u16()? as usize;
-        let width = r.u8()?;
-        r.u8()?;
-        let text =
-            std::str::from_utf8(r.take(length)?).map_err(|_| TerminalError::MalformedSnapshot)?;
-        let mut chars = text.chars();
-        let character = chars.next().ok_or(TerminalError::MalformedSnapshot)?;
-        let suffix = chars.as_str();
+        let value = read_grapheme(&mut r, version)?;
         let mut combining = String::new();
         combining
-            .try_reserve_exact(suffix.len())
+            .try_reserve_exact(value.combining.len())
             .map_err(|_| TerminalError::LimitExceeded)?;
-        combining.push_str(suffix);
+        combining.push_str(value.combining);
         result.push(GraphemeOwned {
-            character,
+            character: value.character,
             combining,
-            width,
+            width: value.width,
+            glyph: value.glyph,
         });
-        r.zero_padding_to4()?;
     }
     Ok(result)
 }
@@ -3176,6 +4624,7 @@ fn decode_screen(
         .checked_mul(meta.columns as usize)
         .ok_or(TerminalError::MalformedSnapshot)?;
     let mut cells = Vec::new();
+    let mut line_renditions = Vec::new();
     let mut soft_wrapped = Vec::new();
     let mut meaningful_end = Vec::new();
     let mut row_metadata = Vec::new();
@@ -3204,6 +4653,10 @@ fn decode_screen(
         let runs = r.u32()?;
         let sealed_revision = if retained_primary { r.u64()? } else { 0 };
         soft_wrapped.push(flags & 1 != 0);
+        line_renditions.push(
+            crate::LineRendition::from_wire((flags >> 2) & 3)
+                .ok_or(TerminalError::MalformedSnapshot)?,
+        );
         if version.has_history() {
             row_metadata.push(RowMetadata {
                 logical_line_id,
@@ -3240,6 +4693,7 @@ fn decode_screen(
                     attributes,
                     protected,
                     hyperlink,
+                    glyph: grapheme.glyph,
                 });
                 if grapheme.width == 2 {
                     let continuation =
@@ -3260,14 +4714,20 @@ fn decode_screen(
         0
     };
     Ok(Screen {
+        width_profile: version.width_profile(),
         columns: meta.columns,
         rows: meta.visible_rows,
         cells,
         soft_wrapped,
+        line_renditions,
         meaningful_end,
         row_metadata,
         next_logical_line_id,
         scrollback_generation_rows,
+        graphic_scrolls: None,
+        graphic_reflow_anchors: Vec::new(),
+        graphic_anchor_generation: 0,
+        graphic_anchor_cache: None,
         storage: StoragePolicy::new(requested_history_rows, MAX_CELLS),
         cursor_row: meta.cursor_row,
         cursor_column: meta.cursor_column,
@@ -3308,6 +4768,7 @@ fn align8(value: usize) -> Option<usize> {
 
 struct Writer {
     bytes: Vec<u8>,
+    limit: usize,
     failed: bool,
 }
 
@@ -3315,6 +4776,7 @@ impl Writer {
     fn new() -> Self {
         Self {
             bytes: Vec::new(),
+            limit: MAX_SNAPSHOT_BYTES,
             failed: false,
         }
     }
@@ -3324,7 +4786,7 @@ impl Writer {
                 .bytes
                 .len()
                 .checked_add(count)
-                .is_none_or(|v| v > MAX_SNAPSHOT_BYTES)
+                .is_none_or(|v| v > self.limit)
             || self.bytes.try_reserve(count).is_err()
         {
             self.failed = true;
@@ -3457,11 +4919,76 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn macro_snapshot_rejects_bad_ids_lengths_and_feature_claims() {
+        let mut terminal = Terminal::new(8, 2).unwrap();
+        terminal.macros.install(0, b"ABC".to_vec(), false).unwrap();
+        terminal.macros.install(63, b"XYZ".to_vec(), false).unwrap();
+        let bytes = export(&terminal).unwrap();
+        let entry = directory_index_for_tag(&bytes, MACROS_STATE);
+        let offset = directory_value(&bytes, entry, 8) as usize;
+        for (relative, value) in [(0, 0u32), (0, 65), (4, 7), (8, 64), (12, u32::MAX), (19, 0)] {
+            assert_mutation_error(&bytes, TerminalError::MalformedSnapshot, |copy| {
+                copy[offset + relative..offset + relative + 4]
+                    .copy_from_slice(&value.to_le_bytes());
+            });
+        }
+        assert_mutation_error(&bytes, TerminalError::IncompatibleSnapshot, |copy| {
+            copy[64..72]
+                .copy_from_slice(&(u64_at(&bytes, 64) & !(MACROS_FEATURE as u64)).to_le_bytes());
+        });
+        let copy = import(&bytes).unwrap();
+        assert_eq!(copy.macros, terminal.macros);
+    }
+
     fn refresh_crc(bytes: &mut [u8]) {
         let payload = crc32c::checksum(&bytes[HEADER_SIZE..]);
         bytes[96..100].copy_from_slice(&payload.to_le_bytes());
         let header = crc32c::checksum(&bytes[..100]);
         bytes[100..104].copy_from_slice(&header.to_le_bytes());
+    }
+
+    #[test]
+    fn pages_snapshot_checks_ids_geometry_counts_resources_and_feature() {
+        let mut terminal = Terminal::new(12, 4).unwrap();
+        terminal
+            .apply_event(crate::Event::Output {
+                source_sequence: 0,
+                bytes: b"\x1b[2 P\x1b[31mA\x1b[4 P\x1b#6B\x1b[?64l\x1b[1 P",
+            })
+            .unwrap();
+        let bytes = export(&terminal).unwrap();
+        let restored = import(&bytes).unwrap();
+        assert_eq!(export(&restored).unwrap(), bytes);
+        let index = directory_index_for_tag(&bytes, PAGES_STATE);
+        let offset = directory_value(&bytes, index, 8) as usize;
+        for (position, value) in [
+            (offset, 0),
+            (offset + 1, 7),
+            (offset + 2, 3),
+            (offset + 3, 1),
+            (offset + 3, 2),
+        ] {
+            assert_mutation_error(&bytes, TerminalError::MalformedSnapshot, |b| {
+                b[position] = value
+            });
+        }
+        for (position, value) in [
+            (offset + 4, 6_u32),
+            (offset + 8, 1),
+            (offset + 16, 1),
+            (offset + 20, u32::MAX),
+            (offset + 24, 13),
+            (offset + 24 + 12, 1),
+        ] {
+            assert_mutation_error(&bytes, TerminalError::MalformedSnapshot, |b| {
+                b[position..position + 4].copy_from_slice(&value.to_le_bytes())
+            });
+        }
+        assert_mutation_error(&bytes, TerminalError::IncompatibleSnapshot, |b| {
+            let features = u64_at(b, 64) & !(PAGES_FEATURE as u64);
+            b[64..72].copy_from_slice(&features.to_le_bytes());
+        });
     }
 
     fn assert_mutation_error(
@@ -3478,6 +5005,61 @@ mod tests {
     fn directory_value(bytes: &[u8], index: usize, field: usize) -> u64 {
         let start = HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE + field;
         u64::from_le_bytes(bytes[start..start + 8].try_into().expect("u64 field"))
+    }
+
+    #[test]
+    fn sgr_stack_snapshot_validates_count_mask_references_and_required_feature() {
+        let mut terminal = Terminal::new(8, 2).unwrap();
+        terminal
+            .apply_event(crate::Event::Output {
+                source_sequence: 0,
+                bytes: b"\x1b[4:3m\x1b[#{\x1b[0m",
+            })
+            .unwrap();
+        let bytes = export(&terminal).unwrap();
+        assert_eq!(import(&bytes).unwrap(), terminal);
+        let index = directory_index_for_tag(&bytes, SGR_STACK_STATE);
+        let offset = directory_value(&bytes, index, 8) as usize;
+        for (position, value) in [
+            (offset, 0),
+            (offset, 11),
+            (offset + 4, 1),
+            (offset + 8, 1 << 6),
+            (offset + 8, 3),
+            (offset + 12, u32::MAX),
+        ] {
+            let mut corrupt = bytes.clone();
+            corrupt[position..position + 4].copy_from_slice(&value.to_le_bytes());
+            refresh_crc(&mut corrupt);
+            assert_eq!(import(&corrupt), Err(TerminalError::MalformedSnapshot));
+        }
+        let mut incompatible = bytes.clone();
+        incompatible[64..72]
+            .copy_from_slice(&(u64_at(&bytes, 64) & !(SGR_STACK_FEATURE as u64)).to_le_bytes());
+        refresh_crc(&mut incompatible);
+        assert_eq!(
+            import(&incompatible),
+            Err(TerminalError::IncompatibleSnapshot)
+        );
+        for history in [false, true] {
+            for keyboard in [false, true] {
+                let mut t = if history {
+                    wrapped_history_terminal()
+                } else {
+                    Terminal::new(8, 2).unwrap()
+                };
+                if keyboard {
+                    t.main_keyboard_protocol.push(7);
+                }
+                t.sgr_stack.push(SavedRendition {
+                    attributes: Attributes::default(),
+                    mask: 1,
+                });
+                let snapshot = export(&t).unwrap();
+                assert_eq!(import(&snapshot).unwrap(), t);
+                assert_eq!(export(&import(&snapshot).unwrap()).unwrap(), snapshot);
+            }
+        }
     }
 
     fn directory_index_for_tag(bytes: &[u8], tag: u32) -> usize {
@@ -3534,6 +5116,39 @@ mod tests {
             section + directory_value(bytes, directory_index, 16) as usize
         );
         result
+    }
+
+    #[test]
+    fn scaled_rows_reject_bad_flags_bounds_and_old_reader_before_install() {
+        let mut terminal = Terminal::new(8, 2).unwrap();
+        terminal
+            .apply_event(crate::Event::Output {
+                source_sequence: 0,
+                bytes: b"\x1b[2;1H\x1b#6ABC",
+            })
+            .unwrap();
+        let bytes = export(&terminal).unwrap();
+        assert_eq!(u16_at(&bytes, 10), 13);
+        let records = row_record_offsets(&bytes, 9);
+        for (offset, value) in [
+            (records[1] + 16, 16_u32),
+            (records[1] + 16, 5),
+            (records[1] + 12, 5),
+            (records[0] + 16, 1),
+        ] {
+            let mut invalid = bytes.clone();
+            invalid[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            refresh_crc(&mut invalid);
+            assert_eq!(import(&invalid), Err(TerminalError::MalformedSnapshot));
+        }
+        let mut old_reader = bytes;
+        old_reader[10..12].copy_from_slice(&12_u16.to_le_bytes());
+        old_reader[12..14].copy_from_slice(&12_u16.to_le_bytes());
+        refresh_crc(&mut old_reader);
+        assert_eq!(
+            import(&old_reader),
+            Err(TerminalError::IncompatibleSnapshot)
+        );
     }
 
     fn wrapped_history_terminal() -> Terminal {
@@ -4750,6 +6365,7 @@ mod tests {
         let preflight = preflight_a(&snapshot).expect("preflight");
         let graphemes = decode_graphemes(
             section(&snapshot, &preflight, GRAPHEME_TABLE).expect("grapheme section"),
+            preflight.version,
         )
         .expect("grapheme table");
         let renditions = decode_renditions(
@@ -5346,7 +6962,20 @@ mod tests {
             assert_eq!(u64_at(&snapshot, 64), expected_features as u64);
             assert_eq!(u64_at(&snapshot, 72), 0);
             assert_eq!(u32_at(&snapshot, 40), SECTION_COUNT_V2_6 as u32);
-            for (index, &tag) in TAGS_V2_6.iter().enumerate() {
+            for (index, tag) in ALL_TAGS
+                .into_iter()
+                .filter(|tag| {
+                    *tag != SGR_STACK_STATE
+                        && *tag != MACROS_STATE
+                        && *tag != PAGES_STATE
+                        && *tag != HOST_GEOMETRY_STATE
+                        && *tag != HOST_THEME_STATE
+                        && *tag != SHELL_INTEGRATION_STATE
+                        && *tag != HOST_SIGNALS_STATE
+                        && *tag != GRAPHICS_STATE
+                })
+                .enumerate()
+            {
                 let base = HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE;
                 assert_eq!(u32_at(&snapshot, base), tag);
                 assert_eq!(u16_at(&snapshot, base + 4), CRITICAL);
@@ -5542,7 +7171,7 @@ mod tests {
                 win32_input,
                 keyboard_protocol,
             };
-            for (index, &tag) in version.tags().iter().enumerate() {
+            for (index, tag) in version.tags().enumerate() {
                 let base = HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE;
                 assert_eq!(u32_at(&snapshot, base), tag);
                 assert_eq!(u16_at(&snapshot, base + 4), CRITICAL);
@@ -5796,7 +7425,7 @@ mod tests {
                 keyboard_protocol,
                 national_replacement,
             };
-            for (index, &tag) in version.tags().iter().enumerate() {
+            for (index, tag) in version.tags().enumerate() {
                 let base = HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE;
                 assert_eq!(u32_at(&snapshot, base), tag);
                 assert_eq!(u16_at(&snapshot, base + 4), CRITICAL);
@@ -5970,11 +7599,18 @@ mod tests {
     fn maximum_capacity_formula_and_preflight_scratch_are_bounded() {
         let payloads = [
             32,
-            152,
+            200,
             24,
             72,
             24,
-            44,
+            52,
+            8 + SGR_STACK_CAPACITY * 8,
+            crate::macros::MAX_SNAPSHOT_BYTES,
+            MAX_PAGES_SECTION_BYTES,
+            crate::HOST_GEOMETRY_V1_BYTES,
+            crate::host_theme::THEME_STATE_BYTES,
+            crate::MAX_SHELL_STATE_BYTES,
+            crate::HOST_SIGNALS_V1_BYTES,
             MAX_OSC_SNAPSHOT_V2_BYTES,
             MAX_GRAPHEME_SECTION_BYTES,
             MAX_RENDITION_SECTION_BYTES,
@@ -5989,38 +7625,431 @@ mod tests {
         let checked_bound = payload_total
             .and_then(|total| total.checked_add(ENVELOPE_BYTES))
             .and_then(|total| {
-                (SECTION_COUNT_V2_6 + 1)
+                (MAX_LEGACY_KNOWN_SECTIONS + 1)
                     .checked_mul(7)
                     .and_then(|padding| total.checked_add(padding))
             })
             .expect("capacity formula does not overflow usize");
         assert_eq!(checked_bound, MAX_CANONICAL_SNAPSHOT_BYTES);
-        assert_eq!(MAX_CANONICAL_SNAPSHOT_BYTES, 44_892_210);
-        assert_eq!(
-            MAX_SNAPSHOT_BYTES - MAX_CANONICAL_SNAPSHOT_BYTES,
-            22_216_654
-        );
+        assert_eq!(MAX_CANONICAL_SNAPSHOT_BYTES, 66_070_235);
+        assert_eq!(MAX_SNAPSHOT_BYTES - MAX_CANONICAL_SNAPSHOT_BYTES, 1_038_629);
+        let graphics_bound = checked_bound
+            .checked_add(39)
+            .and_then(|total| total.checked_add(crate::graphics_state::MAX_GRAPHICS_STATE_BYTES))
+            .and_then(|total| total.checked_add(20 * (MAX_GRAPHEME_TABLE_ENTRIES - 1)))
+            .and_then(|total| total.checked_add(36))
+            .expect("graphics capacity formula does not overflow usize");
+        assert_eq!(graphics_bound, MAX_CANONICAL_GRAPHICS_SNAPSHOT_BYTES);
+        assert_eq!(graphics_bound, 111_470_186);
+        assert!(graphics_bound <= crate::MAX_GRAPHICS_SNAPSHOT_BYTES);
 
         assert_eq!(
             std::mem::size_of::<GraphemeWidths>(),
             GRAPHEME_WIDTH_WORDS * std::mem::size_of::<u64>()
         );
-        assert_eq!(std::mem::size_of::<GraphemeWidths>(), 65_544);
+        assert_eq!(std::mem::size_of::<GraphemeWidths>(), 69_640);
         assert_eq!(
             std::mem::size_of::<GraphemeUses>(),
             GRAPHEME_WIDTH_WORDS * std::mem::size_of::<u64>()
         );
-        assert_eq!(std::mem::size_of::<GraphemeUses>(), 65_544);
+        assert_eq!(std::mem::size_of::<GraphemeUses>(), 69_640);
         assert_eq!(
             std::mem::size_of::<RenditionUses>(),
             RENDITION_USE_WORDS * std::mem::size_of::<u64>()
         );
-        assert_eq!(std::mem::size_of::<RenditionUses>(), 65_544);
+        assert_eq!(std::mem::size_of::<RenditionUses>(), 69_640);
         let table_scratch = std::mem::size_of::<GraphemeWidths>()
             + std::mem::size_of::<GraphemeUses>()
             + std::mem::size_of::<RenditionUses>();
-        assert_eq!(table_scratch, 196_632);
-        assert!(table_scratch + std::mem::size_of::<Preflight>() < 200 * 1024);
+        assert_eq!(table_scratch, 208_920);
+        assert!(table_scratch + std::mem::size_of::<Preflight>() < 210 * 1024);
+    }
+
+    fn drcs_snapshot_fixture() -> (Terminal, GlyphReference, GlyphReference) {
+        let mut terminal = wrapped_history_terminal();
+        let mut graphics = crate::graphics_state::GraphicsState::default();
+        let install =
+            |graphics: &mut crate::graphics_state::GraphicsState, payload, retained: &[u64]| {
+                let download = crate::drcs::decode(&[1, 1, 0, 5, 1, 2, 8, 0], payload).unwrap();
+                graphics.install_font(download, retained).unwrap();
+                match graphics.fonts().lookup(b" @", false, 80, 24, 1) {
+                    crate::drcs_bank::GlyphLookup::Glyph(glyph) => glyph,
+                    other => panic!("missing fixture glyph: {other:?}"),
+                }
+            };
+        let retired = install(&mut graphics, b" @~", &[]);
+        let current = install(&mut graphics, b" @@", &[retired.resource]);
+        assert_ne!(retired.resource, current.resource);
+        assert!(
+            !graphics
+                .fonts()
+                .referenced_resources()
+                .any(|id| id == retired.resource)
+        );
+        terminal.graphics = Some(graphics);
+        for (index, glyph) in [(0, retired), (4, retired), (5, current)] {
+            terminal.main.cells[index].character = '?';
+            terminal.main.cells[index].glyph = Some(glyph);
+        }
+        terminal.main.cells[6].character = '?';
+        terminal.alternate.cells[0].character = '?';
+        terminal.alternate.cells[0].glyph = Some(retired);
+        terminal.alternate.meaningful_end[0] = 1;
+        let mut page = Screen::new(terminal.columns, terminal.rows);
+        page.cells[0].character = '?';
+        page.cells[0].glyph = Some(current);
+        page.meaningful_end[0] = 1;
+        terminal.pages.extra[0] = Some(page);
+        let mut repeat = RepeatSource::new('?');
+        repeat.glyph = Some(current);
+        terminal.repeat_source = Some(repeat);
+        (terminal, retired, current)
+    }
+
+    #[test]
+    fn drcs_snapshot_preserves_history_pages_repeat_and_retired_atlas() {
+        let (terminal, retired, current) = drcs_snapshot_fixture();
+        let bytes = export(&terminal).unwrap();
+        let p = preflight_a(&bytes).unwrap();
+        assert_eq!(p.version.minor(), 22);
+        let index = directory_index_for_tag(&bytes, GRAPHEME_TABLE);
+        assert_eq!(
+            u16_at(&bytes, HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE + 6),
+            2
+        );
+        let graphemes =
+            decode_graphemes(section(&bytes, &p, GRAPHEME_TABLE).unwrap(), p.version).unwrap();
+        let variants: Vec<_> = graphemes
+            .iter()
+            .filter(|g| g.character == '?')
+            .map(|g| g.glyph)
+            .collect();
+        assert_eq!(variants, [None, Some(retired), Some(current)]);
+        let restored = import(&bytes).unwrap();
+        assert_eq!(restored, terminal);
+        assert_eq!(export(&restored).unwrap(), bytes);
+        assert_eq!(
+            restored.repeat_source.as_ref().unwrap().glyph,
+            Some(current)
+        );
+        assert!(
+            restored
+                .graphics
+                .as_ref()
+                .unwrap()
+                .resources()
+                .get(retired.resource)
+                .is_some()
+        );
+        let mut repeat_only = terminal;
+        for cell in repeat_only
+            .main
+            .cells
+            .iter_mut()
+            .chain(&mut repeat_only.alternate.cells)
+            .chain(
+                repeat_only
+                    .pages
+                    .screens_mut()
+                    .flat_map(|page| &mut page.cells),
+            )
+        {
+            cell.glyph = None;
+        }
+        repeat_only.repeat_source.as_mut().unwrap().glyph = Some(retired);
+        let bytes = export(&repeat_only).unwrap();
+        let restored = import(&bytes).unwrap();
+        assert_eq!(restored.repeat_source, repeat_only.repeat_source);
+        assert_eq!(export(&restored).unwrap(), bytes);
+    }
+
+    #[test]
+    fn drcs_snapshot_rejects_bad_glyph_references_during_preflight_without_pixels() {
+        let (mut terminal, retired, current) = drcs_snapshot_fixture();
+        let command = crate::kitty_graphics::TransferDecoder::default()
+            .push(b"Ga=t,s=1,v=1,i=9;AQIDBA==")
+            .unwrap()
+            .unwrap();
+        let graphics = terminal.graphics.as_mut().unwrap();
+        graphics
+            .apply_kitty(
+                command,
+                crate::graphics_state::Anchor {
+                    page: 1,
+                    logical_line: 0,
+                    cell_offset: 0,
+                },
+                crate::HostGeometryV1::default(),
+                &[retired.resource, current.resource],
+            )
+            .unwrap();
+        let rgba = graphics
+            .resources()
+            .entries()
+            .iter()
+            .find(|resource| {
+                resource.image().format() == crate::graphics_resources::ImageFormat::Rgba8888
+            })
+            .unwrap()
+            .id();
+        let bytes = export(&terminal).unwrap();
+        let p = preflight_a(&bytes).unwrap();
+        let table = section(&bytes, &p, GRAPHEME_TABLE).unwrap();
+        let index = directory_index_for_tag(&bytes, GRAPHEME_TABLE);
+        let table_offset = directory_value(&bytes, index, 8) as usize;
+        let mut reader = Reader::new(table);
+        reader.u64().unwrap();
+        let glyph_offset = loop {
+            let offset = reader.offset;
+            let value = read_grapheme(&mut reader, p.version).unwrap();
+            if value.glyph.is_some() {
+                break table_offset + offset;
+            }
+        };
+        for (relative, value) in [
+            (4, 0u32),
+            (4, u32::MAX),
+            (12, u32::MAX),
+            (16, 0),
+            (16, 4097),
+            (20, 0),
+            (20, 4097),
+        ] {
+            let mut bad = bytes.clone();
+            bad[glyph_offset + relative..glyph_offset + relative + 4]
+                .copy_from_slice(&value.to_le_bytes());
+            refresh_crc(&mut bad);
+            let before = crate::graphics_resources::image_allocation_attempts();
+            let preflight = preflight_a(&bad).unwrap();
+            assert_eq!(
+                preflight_b(&bad, &preflight),
+                Err(TerminalError::MalformedSnapshot)
+            );
+            assert_eq!(import(&bad), Err(TerminalError::MalformedSnapshot));
+            assert_eq!(
+                crate::graphics_resources::image_allocation_attempts(),
+                before
+            );
+        }
+        for (relative, value) in [(2, 2), (3, 2)] {
+            assert_mutation_error(&bytes, TerminalError::MalformedSnapshot, |bad| {
+                bad[glyph_offset + relative] = value
+            });
+        }
+        let mut bad_format = bytes.clone();
+        bad_format[glyph_offset + 4..glyph_offset + 12].copy_from_slice(&rgba.to_le_bytes());
+        bad_format[glyph_offset + 12..glyph_offset + 16].copy_from_slice(&0u32.to_le_bytes());
+        bad_format[glyph_offset + 16..glyph_offset + 20].copy_from_slice(&1u32.to_le_bytes());
+        bad_format[glyph_offset + 20..glyph_offset + 24].copy_from_slice(&1u32.to_le_bytes());
+        refresh_crc(&mut bad_format);
+        let before = crate::graphics_resources::image_allocation_attempts();
+        let preflight = preflight_a(&bad_format).unwrap();
+        assert_eq!(
+            preflight_b(&bad_format, &preflight),
+            Err(TerminalError::MalformedSnapshot)
+        );
+        assert_eq!(
+            crate::graphics_resources::image_allocation_attempts(),
+            before
+        );
+        let mut legacy = terminal;
+        legacy.graphics = None;
+        assert_eq!(
+            encode_terminal(&legacy),
+            Err(TerminalError::IncompatibleSnapshot)
+        );
+        assert_mutation_error(&bytes, TerminalError::IncompatibleSnapshot, |bad| {
+            set_directory_u16(bad, index, 6, 1);
+        });
+    }
+
+    #[test]
+    fn graphics_snapshot_checks_screen_anchors_before_allocating_pixels() {
+        let (mut terminal, retired, current) = drcs_snapshot_fixture();
+        let command = crate::kitty_graphics::TransferDecoder::default()
+            .push(b"Ga=T,s=1,v=1,i=9,C=1;AQIDBA==")
+            .unwrap()
+            .unwrap();
+        terminal
+            .graphics
+            .as_mut()
+            .unwrap()
+            .apply_kitty(
+                command,
+                crate::graphics_state::Anchor {
+                    page: 1,
+                    logical_line: terminal.main.row_metadata[0].logical_line_id,
+                    cell_offset: 0,
+                },
+                crate::HostGeometryV1 {
+                    cell_width: 10,
+                    cell_height: 20,
+                    ..Default::default()
+                },
+                &[retired.resource, current.resource],
+            )
+            .unwrap();
+        let bytes = export(&terminal).unwrap();
+        assert_eq!(import(&bytes).unwrap(), terminal);
+        let index = directory_index_for_tag(&bytes, GRAPHICS_STATE);
+        let graphics = directory_value(&bytes, index, 8) as usize;
+        let length = directory_value(&bytes, index, 16) as usize;
+        let placement = graphics
+            + 64
+            + u32_at(&bytes, graphics + 36) as usize
+            + crate::drcs_bank::DRCS_BANK_BYTES
+            + 768
+            + u32_at(&bytes, graphics + 28) as usize * 24;
+        assert_eq!(u32_at(&bytes, graphics + 32), 1);
+        for mutation in 0..3 {
+            let mut bad = bytes.clone();
+            match mutation {
+                0 => bad[placement + 40] = 3, // Page 2 exists in the fixture; page 3 does not.
+                1 => bad[placement + 16..placement + 24]
+                    .copy_from_slice(&(u64::MAX - 1).to_le_bytes()),
+                _ => bad[placement + 24..placement + 28].copy_from_slice(&u32::MAX.to_le_bytes()),
+            }
+            let crc = crc32c::checksum_parts(&[
+                &bad[graphics..graphics + 40],
+                &bad[graphics + 44..graphics + length],
+            ]);
+            bad[graphics + 40..graphics + 44].copy_from_slice(&crc.to_le_bytes());
+            refresh_crc(&mut bad);
+            let before = crate::graphics_resources::image_allocation_attempts();
+            let p = preflight_a(&bad).unwrap();
+            preflight_b(&bad, &p).expect("resource and row metadata remain valid");
+            assert_eq!(import(&bad), Err(TerminalError::MalformedSnapshot));
+            assert_eq!(
+                crate::graphics_resources::image_allocation_attempts(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn graphics_snapshot_rejects_unreferenced_graphemes_without_other_table_features() {
+        let mut terminal = Terminal::new(1, 1).unwrap();
+        terminal.graphics = Some(crate::graphics_state::GraphicsState::default());
+        terminal.main.cells[0].character = 'A';
+        terminal.main.meaningful_end[0] = 1;
+        let version = SnapshotVersion::for_terminal(&terminal);
+        assert!(!version.has_retained_primary_scrollback());
+        assert!(!version.has_repeat_source());
+        assert!(!version.has_cursor_style());
+        let bytes = export(&terminal).unwrap();
+        assert_eq!(import(&bytes).unwrap(), terminal);
+        let index = directory_index_for_tag(&bytes, PRIMARY_ROWS);
+        let row = row_record_offsets(&bytes, index)[0];
+        assert_eq!(u32_at(&bytes, row + 20), 1);
+        assert_eq!(u32_at(&bytes, row + 24), 1);
+        let mut bad = bytes.clone();
+        bad[row + 24..row + 28].copy_from_slice(&0u32.to_le_bytes());
+        refresh_crc(&mut bad);
+        let p = preflight_a(&bad).unwrap();
+        assert_eq!(preflight_b(&bad, &p), Err(TerminalError::MalformedSnapshot));
+        assert_eq!(import(&bad), Err(TerminalError::MalformedSnapshot));
+    }
+
+    #[test]
+    fn drcs_snapshot_maximum_grapheme_table_is_bounded() {
+        use crate::graphics_resources::{GraphicsResources, ImageData, ImageFormat};
+        let mut resources = GraphicsResources::default();
+        let mut graphemes = Vec::with_capacity(MAX_GRAPHEME_TABLE_ENTRIES);
+        graphemes.push(GraphemeRef {
+            character: ' ',
+            combining: "",
+            width: 1,
+            glyph: None,
+        });
+        for _ in 0..(MAX_GRAPHEME_TABLE_ENTRIES - 1).div_ceil(4096) {
+            let resource = resources
+                .insert(ImageData::allocate(4096, 1, ImageFormat::Alpha8).unwrap())
+                .unwrap();
+            for x in 0..4096 {
+                if graphemes.len() == MAX_GRAPHEME_TABLE_ENTRIES {
+                    break;
+                }
+                graphemes.push(GraphemeRef {
+                    character: '?',
+                    combining: "",
+                    width: 1,
+                    glyph: Some(GlyphReference {
+                        resource,
+                        x,
+                        width: 1,
+                        height: 1,
+                    }),
+                });
+            }
+        }
+        let version = SnapshotVersion::V2_22 {
+            features: REQUIRED_FEATURES_V2_1 | GRAPHICS_FEATURE,
+        };
+        let mut writer = Writer::new();
+        writer.limit = crate::MAX_GRAPHICS_SNAPSHOT_BYTES;
+        encode_graphemes(&mut writer, &graphemes, version);
+        let bytes = writer.finish().unwrap();
+        assert_eq!(bytes.len(), 16 + (MAX_GRAPHEME_TABLE_ENTRIES - 1) * 28);
+        assert!(bytes.len() <= MAX_GRAPHEME_SECTION_BYTES + 20 * (MAX_GRAPHEME_TABLE_ENTRIES - 1));
+        let encoded_resources = resources.encode().unwrap();
+        let frame = GraphicsResources::inspect(&encoded_resources).unwrap();
+        let mut widths = GraphemeWidths::new();
+        let before = crate::graphics_resources::image_allocation_attempts();
+        assert_eq!(
+            scan_graphemes(&bytes, &mut widths, version, Some(&frame)).unwrap(),
+            MAX_GRAPHEME_TABLE_ENTRIES
+        );
+        assert_eq!(
+            crate::graphics_resources::image_allocation_attempts(),
+            before
+        );
+    }
+
+    #[test]
+    fn drcs_snapshot_preserves_raw_charset_names_and_checks_padding() {
+        let mut terminal = Terminal::new(4, 2).unwrap();
+        terminal.graphics = Some(crate::graphics_state::GraphicsState::default());
+        for (state, prefix, final_byte) in [
+            (&mut terminal.charset, &b""[..], b'1'),
+            (&mut terminal.main_saved_charset, &b" "[..], b'@'),
+            (&mut terminal.alternate_saved_charset, &b"&%"[..], b'@'),
+        ] {
+            state.set_designation(
+                GraphicRegister::G0,
+                CharsetDesignation::decode_with_soft(
+                    CharsetSize::Characters94,
+                    prefix,
+                    final_byte,
+                    true,
+                )
+                .unwrap(),
+            );
+        }
+        terminal.user_preferred_charset =
+            CharsetDesignation::decode_with_soft(CharsetSize::Characters94, b"", b'C', true)
+                .unwrap();
+        let bytes = export(&terminal).unwrap();
+        let index = directory_index_for_tag(&bytes, CHARSET_STATE);
+        let offset = directory_value(&bytes, index, 8) as usize;
+        assert_eq!(
+            u16_at(&bytes, HEADER_SIZE + index * DIRECTORY_ENTRY_SIZE + 6),
+            4
+        );
+        assert_eq!(directory_value(&bytes, index, 16), 88);
+        assert_eq!(&bytes[offset + 8..offset + 12], &[94, b'1', 0, 0]);
+        assert_eq!(import(&bytes).unwrap(), terminal);
+        assert_eq!(export(&import(&bytes).unwrap()).unwrap(), bytes);
+        for (relative, value) in [(8, 0), (9, 0), (10, b'@'), (11, b'@')] {
+            assert_mutation_error(&bytes, TerminalError::MalformedSnapshot, |bad| {
+                bad[offset + relative] = value
+            });
+        }
+        let mut legacy = terminal;
+        legacy.graphics = None;
+        assert_eq!(
+            encode_terminal(&legacy),
+            Err(TerminalError::IncompatibleSnapshot)
+        );
     }
 
     #[test]

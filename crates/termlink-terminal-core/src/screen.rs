@@ -1,8 +1,8 @@
 use crate::osc::HyperlinkRef;
-use crate::unicode_width::{grapheme_width, scalar_width};
+use crate::unicode_width::scalar_width;
 use crate::{
-    Attributes, Cell, Color, MAX_CELLS, MAX_GRAPHEME_BYTES, TerminalError, UnderlineStyle,
-    cell_index,
+    Attributes, Cell, Color, LineRendition, MAX_CELLS, MAX_GRAPHEME_BYTES, TerminalError,
+    UnderlineStyle, cell_index,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,10 +32,17 @@ impl Default for SavedCursor {
 
 #[derive(Clone, Debug)]
 pub(super) struct Screen {
+    // Runtime-only observation during an enclosing candidate transaction; never serialized.
+    pub(super) graphic_scrolls: Option<Vec<GraphicScroll>>,
+    pub(super) graphic_reflow_anchors: Vec<(u64, u32)>,
+    pub(super) graphic_anchor_generation: u64,
+    pub(super) graphic_anchor_cache: Option<crate::terminal_graphics_motion::GraphicAnchorCache>,
+    pub(super) width_profile: crate::WidthProfile,
     pub(super) columns: u32,
     pub(super) rows: u32,
     pub(super) cells: Vec<Cell>,
     pub(super) soft_wrapped: Vec<bool>,
+    pub(super) line_renditions: Vec<LineRendition>,
     pub(super) meaningful_end: Vec<u32>,
     pub(super) row_metadata: Vec<RowMetadata>,
     pub(super) next_logical_line_id: u64,
@@ -53,14 +60,26 @@ pub(super) struct Screen {
     pub(super) saved: SavedCursor,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GraphicScroll {
+    pub(super) top: u32,
+    pub(super) bottom: u32,
+    pub(super) left: u32,
+    pub(super) right: u32,
+    pub(super) delta: i32,
+    pub(super) trimmed: u32,
+}
+
 // Runtime row anchors deliberately remain outside Snapshot V2.0. Screen equality keeps
 // its V2.0 semantic meaning until a later snapshot version makes anchors persistent.
 impl PartialEq for Screen {
     fn eq(&self, other: &Self) -> bool {
         self.columns == other.columns
+            && self.width_profile == other.width_profile
             && self.rows == other.rows
             && self.cells == other.cells
             && self.soft_wrapped == other.soft_wrapped
+            && self.line_renditions == other.line_renditions
             && self.meaningful_end == other.meaningful_end
             && self.storage == other.storage
             && self.cursor_row == other.cursor_row
@@ -296,6 +315,7 @@ struct LogicalCell {
 }
 
 struct LogicalLine {
+    rendition: LineRendition,
     metadata: RowMetadata,
     cells: Vec<LogicalCell>,
     old_width: u32,
@@ -321,10 +341,16 @@ impl Screen {
             cell_cap.max(super::cell_count(columns, rows)),
         );
         Self {
+            width_profile: crate::WidthProfile::LegacyV1,
+            graphic_scrolls: None,
+            graphic_reflow_anchors: Vec::new(),
+            graphic_anchor_generation: 0,
+            graphic_anchor_cache: None,
             columns,
             rows,
             cells: vec![Cell::default(); super::cell_count(columns, rows)],
             soft_wrapped,
+            line_renditions: vec![LineRendition::SingleWidth; rows as usize],
             meaningful_end,
             row_metadata,
             next_logical_line_id,
@@ -366,19 +392,37 @@ impl Screen {
     pub(super) fn render_window(&self, offset_rows: u32) -> Self {
         let offset_rows = offset_rows.min(self.viewport_top());
         let first_row = self.viewport_top() - offset_rows;
-        let end_row = first_row + self.rows;
+        let mut window = self.render_range(first_row, self.rows);
+        if offset_rows == 0 {
+            window.cursor_row = self.cursor_row;
+            window.cursor_column = self.cursor_column;
+            window.wrap_pending = self.wrap_pending;
+            window.attributes = self.attributes;
+            window.protected = self.protected;
+            window.saved = self.saved;
+        }
+        window
+    }
+
+    pub(super) fn render_range(&self, first_row: u32, rows: u32) -> Self {
+        assert!(rows > 0 && first_row <= self.stored_rows() - rows);
+        let end_row = first_row + rows;
         let first_cell = cell_index(self.columns, first_row, 0);
         let end_cell = cell_index(self.columns, end_row, 0);
         let first_row = usize::try_from(first_row).expect("bounded render-window row");
         let end_row = usize::try_from(end_row).expect("bounded render-window row");
 
-        let mut window = Self::new(self.columns, self.rows);
+        let mut window = Self::new(self.columns, rows);
+        window.width_profile = self.width_profile;
         window
             .cells
             .clone_from_slice(&self.cells[first_cell..end_cell]);
         window
             .soft_wrapped
             .clone_from_slice(&self.soft_wrapped[first_row..end_row]);
+        window
+            .line_renditions
+            .clone_from_slice(&self.line_renditions[first_row..end_row]);
         window
             .meaningful_end
             .clone_from_slice(&self.meaningful_end[first_row..end_row]);
@@ -400,14 +444,6 @@ impl Screen {
         }
         window.next_logical_line_id = self.next_logical_line_id;
         window.scrollback_generation_rows = self.scrollback_generation_rows;
-        if offset_rows == 0 {
-            window.cursor_row = self.cursor_row;
-            window.cursor_column = self.cursor_column;
-            window.wrap_pending = self.wrap_pending;
-            window.attributes = self.attributes;
-            window.protected = self.protected;
-            window.saved = self.saved;
-        }
         window
     }
 
@@ -435,13 +471,49 @@ impl Screen {
         usize::try_from(self.visible_stored_row(row)).expect("bounded row")
     }
 
+    pub(super) fn shell_cursor_anchor(&self) -> (u64, u32) {
+        let metadata = self.visible_row_metadata(self.cursor_row);
+        (
+            metadata.logical_line_id,
+            metadata.logical_cell_offset + self.cursor_column + u32::from(self.wrap_pending),
+        )
+    }
+
     fn visible_row_metadata(&self, row: u32) -> RowMetadata {
         self.row_metadata[self.visible_row_index(row)]
     }
 
-    fn visible_row_metadata_mut(&mut self, row: u32) -> &mut RowMetadata {
-        let row = self.visible_row_index(row);
-        &mut self.row_metadata[row]
+    fn graphic_geometry_changed(&mut self) {
+        self.graphic_anchor_generation = self.graphic_anchor_generation.wrapping_add(1);
+        // Clearing on every mutation also prevents reusing a cache after generation wraparound.
+        self.graphic_anchor_cache = None;
+    }
+
+    fn set_row_metadata(&mut self, row: usize, metadata: RowMetadata) {
+        let old = self.row_metadata[row];
+        if old.logical_line_id != metadata.logical_line_id
+            || old.logical_cell_offset != metadata.logical_cell_offset
+        {
+            self.graphic_geometry_changed();
+        }
+        self.row_metadata[row] = metadata;
+    }
+
+    fn set_row_rendition(&mut self, row: usize, rendition: LineRendition) {
+        if self.line_renditions[row] != rendition {
+            self.graphic_geometry_changed();
+            self.line_renditions[row] = rendition;
+        }
+    }
+
+    fn reset_line_renditions(&mut self, first: usize, end: usize) {
+        if self.line_renditions[first..end]
+            .iter()
+            .any(|r| *r != LineRendition::SingleWidth)
+        {
+            self.graphic_geometry_changed();
+            self.line_renditions[first..end].fill(LineRendition::SingleWidth);
+        }
     }
 
     fn storage_policy(&self) -> StoragePolicy {
@@ -484,12 +556,107 @@ impl Screen {
         (metadata, next_logical_line_id)
     }
 
+    pub(super) fn line_columns(&self, row: u32) -> u32 {
+        self.line_renditions[self.visible_row_index(row)].columns(self.columns)
+    }
+
+    pub(super) fn has_line_renditions(&self) -> bool {
+        self.line_renditions
+            .iter()
+            .any(|value| *value != LineRendition::SingleWidth)
+    }
+
+    pub(super) fn finish_line_edit(&mut self) -> Result<(), TerminalError> {
+        for row in self.viewport_top() as usize..self.stored_rows() as usize {
+            if self.line_renditions[row] != LineRendition::SingleWidth {
+                self.detach_line(row)?;
+                self.crop_scaled_row(row);
+            }
+        }
+        self.canonicalize_cursor_cells();
+        Ok(())
+    }
+
+    pub(super) fn reset_visible_line_renditions(&mut self) {
+        let first = self.viewport_top() as usize;
+        self.reset_line_renditions(first, self.line_renditions.len());
+    }
+
+    pub(super) fn set_line_rendition(
+        &mut self,
+        rendition: LineRendition,
+    ) -> Result<(), TerminalError> {
+        let row = self.visible_row_index(self.cursor_row);
+        // A DEC scaled line is fixed-width and never joins a reflowable logical line.
+        self.detach_line(row)?;
+        self.set_row_rendition(row, rendition);
+        self.crop_scaled_row(row);
+        self.wrap_pending = false;
+        self.canonicalize_cursor_cells();
+        Ok(())
+    }
+
+    fn detach_line(&mut self, row: usize) -> Result<(), TerminalError> {
+        if row > 0 && self.soft_wrapped[row - 1] {
+            self.soft_wrapped[row - 1] = false;
+            let metadata = RowMetadata::line_head(
+                self.allocate_logical_line_id()
+                    .ok_or(TerminalError::LimitExceeded)?,
+            );
+            self.set_row_metadata(row, metadata);
+        }
+        if self.soft_wrapped[row] {
+            self.soft_wrapped[row] = false;
+            let metadata = RowMetadata::line_head(
+                self.allocate_logical_line_id()
+                    .ok_or(TerminalError::LimitExceeded)?,
+            );
+            self.set_row_metadata(row + 1, metadata);
+        }
+        self.normalize_row_metadata();
+        Ok(())
+    }
+
+    fn crop_scaled_row(&mut self, row: usize) {
+        let end = self.line_renditions[row].columns(self.columns) as usize;
+        let start = row * self.columns as usize;
+        if end < self.columns as usize {
+            if self.cells[start + end].continuation {
+                self.cells[start + end - 1] = Cell::blank(self.standard_erase_attributes());
+            }
+            let blank = Cell::blank(self.standard_erase_attributes());
+            self.cells[start + end..start + self.columns as usize].fill(blank);
+            self.meaningful_end[row] = self.meaningful_end[row].min(end as u32);
+        }
+    }
+
+    pub(super) fn alignment_pattern(&mut self) -> Result<(), TerminalError> {
+        let start = self.viewport_top() as usize;
+        for row in start..self.stored_rows() as usize {
+            self.detach_line(row)?;
+            self.set_row_rendition(row, LineRendition::SingleWidth);
+            let cell_start = row * self.columns as usize;
+            self.cells[cell_start..cell_start + self.columns as usize].fill(Cell::lead(
+                'E',
+                1,
+                Attributes::default(),
+            ));
+            self.meaningful_end[row] = self.columns;
+        }
+        self.attributes = self.standard_erase_attributes();
+        self.position_cursor(0, 0);
+        self.canonicalize_cursor_cells();
+        Ok(())
+    }
+
     pub(super) fn reset(&mut self) {
         let Some(row_metadata) = self.fresh_line_heads(self.rows) else {
             return;
         };
+        self.graphic_geometry_changed();
         self.cells = vec![Cell::default(); super::cell_count(self.columns, self.rows)];
         self.soft_wrapped = vec![false; usize::try_from(self.rows).expect("bounded rows")];
+        self.line_renditions = vec![LineRendition::SingleWidth; self.rows as usize];
         self.meaningful_end = vec![0; usize::try_from(self.rows).expect("bounded rows")];
         self.row_metadata = row_metadata;
         self.cursor_row = 0;
@@ -524,10 +691,12 @@ impl Screen {
         let stored_rows = history_rows + rows;
         let mut resized = vec![Cell::default(); super::cell_count(columns, stored_rows)];
         let mut meaningful_end = vec![0; usize::try_from(stored_rows).expect("bounded rows")];
+        let mut line_renditions = vec![LineRendition::SingleWidth; stored_rows as usize];
         let mut row_metadata =
             Vec::with_capacity(usize::try_from(stored_rows).expect("bounded rows"));
         for (target_row, &source_row) in source_rows.iter().enumerate() {
             let source_index = usize::try_from(source_row).expect("bounded row");
+            line_renditions[target_row] = self.line_renditions[source_index];
             meaningful_end[target_row] = old_meaningful_end[source_index].min(columns);
             if source_index == 0 || !old_soft_wrapped[source_index - 1] {
                 row_metadata.push(old_metadata[source_index]);
@@ -553,11 +722,13 @@ impl Screen {
             return;
         };
         row_metadata.extend(fresh_metadata);
+        self.graphic_geometry_changed();
         self.columns = columns;
         self.rows = rows;
         self.cells = resized;
         self.soft_wrapped = vec![false; usize::try_from(stored_rows).expect("bounded rows")];
         self.meaningful_end = meaningful_end;
+        self.line_renditions = line_renditions;
         self.row_metadata = row_metadata;
         self.apply_storage_policy(storage);
         self.cursor_row = self.cursor_row.min(rows - 1);
@@ -582,6 +753,7 @@ impl Screen {
         let lines = self.logical_lines(cursor, saved);
         let mut cells = Vec::new();
         let mut soft_wrapped = Vec::new();
+        let mut line_renditions = Vec::new();
         let mut meaningful_end = Vec::new();
         let mut row_metadata = Vec::new();
         let mut new_cursor = None;
@@ -606,6 +778,7 @@ impl Screen {
             {
                 cells.extend(row_cells);
                 soft_wrapped.push(row_index + 1 < layout.row_count);
+                line_renditions.push(line.rendition);
                 meaningful_end.push(layout.meaningful_end[row_index]);
                 row_metadata.push(metadata);
             }
@@ -630,6 +803,7 @@ impl Screen {
                 usize::try_from(columns).expect("bounded columns")
             ]);
             soft_wrapped.push(false);
+            line_renditions.push(LineRendition::SingleWidth);
             meaningful_end.push(0);
             row_metadata.push(RowMetadata::line_head(
                 self.allocate_logical_line_id()
@@ -644,6 +818,7 @@ impl Screen {
         let retained_end = viewport + target_rows;
         cells.truncate(retained_end * usize::try_from(columns).expect("bounded columns"));
         soft_wrapped.truncate(retained_end);
+        line_renditions.truncate(retained_end);
         meaningful_end.truncate(retained_end);
         row_metadata.truncate(retained_end);
         soft_wrapped[retained_end - 1] = false;
@@ -654,6 +829,7 @@ impl Screen {
                 .any(|metadata| metadata.logical_line_id == first_kept_id);
             cells.drain(..retained_start * usize::try_from(columns).expect("bounded columns"));
             soft_wrapped.drain(..retained_start);
+            line_renditions.drain(..retained_start);
             meaningful_end.drain(..retained_start);
             row_metadata.drain(..retained_start);
             if truncated_logical_head {
@@ -667,6 +843,8 @@ impl Screen {
         self.rows = rows;
         self.cells = cells;
         self.soft_wrapped = soft_wrapped;
+        self.graphic_geometry_changed();
+        self.line_renditions = line_renditions;
         self.meaningful_end = meaningful_end;
         self.row_metadata = row_metadata;
         self.apply_storage_policy(storage);
@@ -682,6 +860,7 @@ impl Screen {
         self.saved.wrap_pending = saved_wrap;
         self.cursor_row = self.cursor_row.min(rows - 1);
         self.saved.row = self.saved.row.min(rows - 1);
+        self.canonicalize_cursor_cells();
         debug_assert_eq!(
             self.viewport_top(),
             u32::try_from(retained_history).expect("bounded history rows")
@@ -696,6 +875,15 @@ impl Screen {
         let mut wrap = false;
         for row in 0..self.stored_rows() {
             let row_index = usize::try_from(row).expect("bounded row");
+            if self.line_renditions[row_index] != LineRendition::SingleWidth {
+                total_rows += 1;
+                if total_rows.saturating_mul(u64::from(columns))
+                    > self.storage_policy().cell_cap as u64
+                {
+                    return Err(TerminalError::LimitExceeded);
+                }
+                continue;
+            }
             for source_column in 0..self.meaningful_end[row_index] {
                 let cell = &self.cells[cell_index(self.columns, row, source_column)];
                 if cell.continuation {
@@ -754,7 +942,10 @@ impl Screen {
 
     pub(super) fn restore_cursor(&mut self) -> (bool, bool) {
         self.cursor_row = self.saved.row.min(self.rows - 1);
-        self.cursor_column = self.saved.column.min(self.columns - 1);
+        self.cursor_column = self
+            .saved
+            .column
+            .min(self.line_columns(self.cursor_row) - 1);
         self.wrap_pending = self.saved.wrap_pending;
         self.attributes = self.saved.attributes;
         self.protected = self.saved.protected;
@@ -903,13 +1094,16 @@ impl Screen {
             self.columns,
             hyperlink,
             scroll_cause,
+            self.width_profile == crate::WidthProfile::Unicode16,
+            true,
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn print_in_rectangle_with_mode_and_scroll_cause(
         &mut self,
-        mut character: char,
+        character: char,
         insert_mode: bool,
         auto_wrap: bool,
         top: u32,
@@ -918,10 +1112,44 @@ impl Screen {
         right: u32,
         hyperlink: Option<HyperlinkRef>,
         scroll_cause: ScrollCause,
+        grapheme_clustering: bool,
+        join_previous: bool,
+    ) -> Result<(), TerminalError> {
+        self.print_graphic_in_rectangle(
+            character,
+            None,
+            insert_mode,
+            auto_wrap,
+            top,
+            bottom,
+            left,
+            right,
+            hyperlink,
+            scroll_cause,
+            grapheme_clustering,
+            join_previous,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn print_graphic_in_rectangle(
+        &mut self,
+        mut character: char,
+        glyph: Option<crate::drcs_bank::GlyphReference>,
+        insert_mode: bool,
+        auto_wrap: bool,
+        top: u32,
+        bottom: u32,
+        left: u32,
+        right: u32,
+        hyperlink: Option<HyperlinkRef>,
+        scroll_cause: ScrollCause,
+        grapheme_clustering: bool,
+        join_previous: bool,
     ) -> Result<(), TerminalError> {
         self.prepare_for_mutation();
         let rectangle = self.clipped_rectangle(top, left, bottom, right);
-        let (line_left, line_right) = rectangle
+        let (mut line_left, mut line_right) = rectangle
             .filter(|rectangle| {
                 self.cursor_row >= rectangle.top
                     && self.cursor_row < rectangle.bottom
@@ -931,7 +1159,79 @@ impl Screen {
             .map_or((0, self.columns), |rectangle| {
                 (rectangle.left, rectangle.right)
             });
-        let mut width = scalar_width(character);
+        let unscaled_line_right = line_right;
+        line_right = line_right.min(self.line_columns(self.cursor_row));
+        line_left = line_left.min(line_right - 1);
+        let mut width = if glyph.is_some() {
+            1
+        } else {
+            self.width_profile.scalar_width(character)
+        };
+        if glyph.is_none()
+            && width == 0
+            && self
+                .previous_lead_index(auto_wrap, line_left, line_right)
+                .is_some_and(|index| self.cells[index].glyph.is_some())
+        {
+            // A downloaded cell has no Unicode cluster to extend or widen.
+            character = '\u{fffd}';
+            width = 1;
+        }
+        if self.width_profile == crate::WidthProfile::Unicode16 {
+            if let Some(index) = self.previous_lead_index(auto_wrap, line_left, line_right)
+                && join_previous
+                && glyph.is_none()
+                && self.cells[index].glyph.is_none()
+                && (grapheme_clustering || width == 0)
+                && self.width_profile.extends(
+                    self.cells[index].character,
+                    &self.cells[index].combining,
+                    character,
+                )
+            {
+                if self.cells[index].grapheme_bytes() + character.len_utf8()
+                    > self.width_profile.max_grapheme_bytes()
+                {
+                    return Err(TerminalError::Unsupported("grapheme size limit"));
+                }
+                let cell = &mut self.cells[index];
+                cell.combining
+                    .try_reserve(character.len_utf8())
+                    .map_err(|_| TerminalError::LimitExceeded)?;
+                cell.combining.push(character);
+                let next_width = self
+                    .width_profile
+                    .grapheme_width(cell.character, &cell.combining);
+                if next_width == 2 {
+                    self.upgrade_grapheme_to_wide(
+                        index,
+                        auto_wrap,
+                        top,
+                        bottom,
+                        left,
+                        right,
+                        line_left,
+                        line_right,
+                        scroll_cause,
+                    )?;
+                } else if cell.width == 2 {
+                    cell.width = 1;
+                    self.cells[index + 1] = Cell::blank(self.standard_erase_attributes());
+                    let row = index / self.columns as usize;
+                    let end = (index % self.columns as usize) as u32 + 1;
+                    if self.meaningful_end[row] == end + 1 {
+                        self.meaningful_end[row] = end;
+                        self.refresh_continuation_metadata(row);
+                    }
+                    if row == self.visible_row_index(self.cursor_row) {
+                        self.cursor_column = end;
+                        self.wrap_pending = false;
+                    }
+                }
+                return Ok(());
+            }
+            width = width.max(1);
+        }
         if width == 0 {
             return self.append_combining(
                 character,
@@ -950,7 +1250,10 @@ impl Screen {
                 "wide grapheme in one-column terminal",
             ));
         }
-        if width == 2 && self.previous_grapheme_ends_with_joiner(auto_wrap, line_left, line_right) {
+        if self.width_profile == crate::WidthProfile::LegacyV1
+            && width == 2
+            && self.previous_grapheme_ends_with_joiner(auto_wrap, line_left, line_right)
+        {
             return self.append_joined_scalar(
                 character,
                 auto_wrap,
@@ -976,6 +1279,13 @@ impl Screen {
                     return Err(TerminalError::LimitExceeded);
                 }
                 self.cursor_column = line_left;
+                line_right = unscaled_line_right.min(self.line_columns(self.cursor_row));
+                line_left = line_left.min(line_right - 1);
+                self.cursor_column = line_left;
+                if u32::from(width) > line_right - line_left {
+                    character = '\u{fffd}';
+                    width = 1;
+                }
             } else {
                 self.wrap_pending = false;
                 if width == 2 && self.cursor_column + 1 >= line_right {
@@ -1003,6 +1313,7 @@ impl Screen {
             self.protected,
             hyperlink,
         );
+        self.cells[index].glyph = glyph;
         if width == 2 {
             self.clear_grapheme_at(self.cursor_row, self.cursor_column + 1);
             self.cells[index + 1] = Cell::continuation_from(&self.cells[index]);
@@ -1160,12 +1471,29 @@ impl Screen {
 
         let column = self.cursor_column;
         let count = normalized_count(count, rectangle.right - column);
+        self.delete_columns_in_range(
+            rectangle.top,
+            rectangle.bottom,
+            column,
+            rectangle.right,
+            count,
+        );
+    }
+
+    fn delete_columns_in_range(
+        &mut self,
+        top: u32,
+        bottom: u32,
+        column: u32,
+        right: u32,
+        count: u32,
+    ) {
         let start = usize::try_from(column).expect("bounded column");
-        let right = usize::try_from(rectangle.right).expect("bounded column");
+        let right = usize::try_from(right).expect("bounded column");
         let count = usize::try_from(count).expect("bounded count");
         let tail = right - count;
         let erase_attributes = self.standard_erase_attributes();
-        for row_index in rectangle.top..rectangle.bottom {
+        for row_index in top..bottom {
             let mut row = self.row_cells(row_index);
             let mut meaningful = self.row_meaningful(row_index);
             row[start..right].rotate_left(count);
@@ -1179,6 +1507,58 @@ impl Screen {
                 meaningful,
                 erase_attributes,
             );
+        }
+    }
+
+    pub(super) fn horizontal_index(
+        &mut self,
+        forward: bool,
+        top: u32,
+        bottom: u32,
+        left: u32,
+        right: u32,
+    ) {
+        self.prepare_for_mutation();
+        self.wrap_pending = false;
+        let Some(rectangle) = self.clipped_rectangle(top, left, bottom, right) else {
+            return;
+        };
+        let edge = if forward {
+            rectangle.right - 1
+        } else {
+            rectangle.left
+        };
+        if self.cursor_column == edge
+            && (rectangle.top..rectangle.bottom).contains(&self.cursor_row)
+        {
+            if forward {
+                self.delete_columns_in_range(
+                    rectangle.top,
+                    rectangle.bottom,
+                    rectangle.left,
+                    rectangle.right,
+                    1,
+                );
+            } else {
+                let attributes = self.standard_erase_attributes();
+                for row in rectangle.top..rectangle.bottom {
+                    self.insert_blank_cells_in_range(
+                        row,
+                        rectangle.left,
+                        rectangle.right,
+                        1,
+                        attributes,
+                    );
+                }
+            }
+            self.snap_cursor_from_continuation();
+        } else {
+            let column = if forward {
+                self.cursor_column.saturating_add(1)
+            } else {
+                self.cursor_column.saturating_sub(1)
+            };
+            self.position_cursor(self.cursor_row, column);
         }
     }
 
@@ -1462,9 +1842,24 @@ impl Screen {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn fill_rectangle_with_hyperlink(
         &mut self,
         character: char,
+        top: u32,
+        left: u32,
+        bottom: u32,
+        right: u32,
+        hyperlink: Option<HyperlinkRef>,
+    ) -> Result<(), TerminalError> {
+        self.fill_rectangle_with_glyph(character, None, top, left, bottom, right, hyperlink)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fill_rectangle_with_glyph(
+        &mut self,
+        character: char,
+        glyph: Option<crate::drcs_bank::GlyphReference>,
         top: u32,
         left: u32,
         bottom: u32,
@@ -1480,8 +1875,9 @@ impl Screen {
             return Ok(());
         };
         self.prepare_for_mutation();
-        let fill =
+        let mut fill =
             Cell::lead_with_presentation(character, 1, self.attributes, self.protected, hyperlink);
+        fill.glyph = glyph;
         let selected_start = usize::try_from(rectangle.left).expect("bounded rectangle column");
         let selected_end = usize::try_from(rectangle.right).expect("bounded rectangle column");
         for row_index in rectangle.top..rectangle.bottom {
@@ -1496,6 +1892,7 @@ impl Screen {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn copy_rectangle(
         &mut self,
         source_top: u32,
@@ -1505,8 +1902,22 @@ impl Screen {
         destination_top: u32,
         destination_left: u32,
     ) {
+        self.copy_rectangle_from(
+            None,
+            (source_top, source_left, source_bottom, source_right),
+            (destination_top, destination_left),
+        );
+    }
+
+    pub(super) fn copy_rectangle_from(
+        &mut self,
+        from: Option<&Self>,
+        (source_top, source_left, source_bottom, source_right): (u32, u32, u32, u32),
+        (destination_top, destination_left): (u32, u32),
+    ) {
+        let from = from.unwrap_or(self);
         let Some(source) =
-            self.clipped_rectangle(source_top, source_left, source_bottom, source_right)
+            from.clipped_rectangle(source_top, source_left, source_bottom, source_right)
         else {
             return;
         };
@@ -1528,8 +1939,8 @@ impl Screen {
             Vec::with_capacity(usize::try_from(copy_rows).expect("bounded rectangle height"));
         for row_offset in 0..copy_rows {
             let source_row = source.top + row_offset;
-            let row = self.row_cells(source_row);
-            let meaningful = self.row_meaningful(source_row);
+            let row = from.row_cells(source_row);
+            let meaningful = from.row_meaningful(source_row);
             let mut copied_cells = row[source_left..source_right].to_vec();
             let mut copied_meaningful = meaningful[source_left..source_right].to_vec();
             repair_horizontal_boundaries(
@@ -1655,7 +2066,7 @@ impl Screen {
     pub(super) fn position_cursor(&mut self, row: u32, column: u32) {
         self.prepare_for_mutation();
         self.cursor_row = row.min(self.rows - 1);
-        self.cursor_column = column.min(self.columns - 1);
+        self.cursor_column = column.min(self.line_columns(self.cursor_row) - 1);
         self.wrap_pending = false;
         self.snap_cursor_from_continuation();
     }
@@ -1666,6 +2077,17 @@ impl Screen {
         let visible_start = self.visible_cell_index(0, 0);
         let cursor = self.visible_cell_index(self.cursor_row, self.cursor_column);
         let visible_end = visible_start + self.visible_cells().len();
+        let row = self.visible_row_index(self.cursor_row);
+        let first = self.viewport_top() as usize;
+        match mode {
+            0 => self.reset_line_renditions(
+                row + usize::from(self.cursor_column != 0),
+                self.line_renditions.len(),
+            ),
+            1 => self.reset_line_renditions(first, row),
+            2 => self.reset_line_renditions(first, self.line_renditions.len()),
+            _ => {}
+        }
         match mode {
             0 => self.erase_range(cursor, visible_end),
             1 => self.erase_range(visible_start, cursor + 1),
@@ -1686,7 +2108,7 @@ impl Screen {
         let line_start = self.visible_cell_index(self.cursor_row, 0);
         let cursor =
             line_start + usize::try_from(self.cursor_column).expect("bounded cursor column");
-        let line_end = line_start + usize::try_from(self.columns).expect("bounded column count");
+        let line_end = line_start + self.line_columns(self.cursor_row) as usize;
         match mode {
             0 => self.erase_range(cursor, line_end),
             1 => self.erase_range(line_start, cursor + 1),
@@ -1701,6 +2123,7 @@ impl Screen {
         if self.cells.len()
             != self.soft_wrapped.len() * usize::try_from(self.columns).expect("bounded columns")
             || self.meaningful_end.len() != self.soft_wrapped.len()
+            || self.line_renditions.len() != self.soft_wrapped.len()
             || self.row_metadata.len() != self.soft_wrapped.len()
             || self.soft_wrapped.is_empty()
             || self.cells.len() > MAX_CELLS
@@ -1712,9 +2135,9 @@ impl Screen {
         if self.viewport_top() > self.history_capacity()
             || self.soft_wrapped.last().copied().unwrap_or(true)
             || self.cursor_row >= self.rows
-            || self.cursor_column >= self.columns
+            || self.cursor_column >= self.line_columns(self.cursor_row)
             || self.saved.row >= self.rows
-            || self.saved.column >= self.columns
+            || self.saved.column >= self.line_columns(self.saved.row)
         {
             return Err(TerminalError::MalformedSnapshot);
         }
@@ -1725,16 +2148,26 @@ impl Screen {
         {
             return Err(TerminalError::MalformedSnapshot);
         }
+        let mut line_heads = std::collections::HashSet::new();
+        line_heads
+            .try_reserve(self.row_metadata.len())
+            .map_err(|_| TerminalError::LimitExceeded)?;
         for row in 0..self.stored_rows() {
             let row_index = usize::try_from(row).expect("bounded row");
             let meaningful_end = self.meaningful_end[row_index];
             let metadata = self.row_metadata[row_index];
-            if meaningful_end > self.columns
+            if meaningful_end > self.line_renditions[row_index].columns(self.columns)
                 || metadata.logical_line_id >= self.next_logical_line_id
             {
                 return Err(TerminalError::MalformedSnapshot);
             }
             if metadata.flags & !ROW_FLAG_HEAD_TRUNCATED != 0 {
+                return Err(TerminalError::MalformedSnapshot);
+            }
+            if self.line_renditions[row_index] != LineRendition::SingleWidth
+                && (self.soft_wrapped[row_index]
+                    || row_index > 0 && self.soft_wrapped[row_index - 1])
+            {
                 return Err(TerminalError::MalformedSnapshot);
             }
             let split_at_visible_boundary = row == self.viewport_top()
@@ -1759,13 +2192,8 @@ impl Screen {
                 if metadata.logical_cell_offset != 0 && !metadata.is_head_truncated() {
                     return Err(TerminalError::MalformedSnapshot);
                 }
-                for previous_row in 0..row_index {
-                    if (previous_row == 0 || !self.soft_wrapped[previous_row - 1])
-                        && self.row_metadata[previous_row].logical_line_id
-                            == metadata.logical_line_id
-                    {
-                        return Err(TerminalError::MalformedSnapshot);
-                    }
+                if !line_heads.insert(metadata.logical_line_id) {
+                    return Err(TerminalError::MalformedSnapshot);
                 }
             }
             for column in 0..self.columns {
@@ -1776,6 +2204,7 @@ impl Screen {
                         || cell.width != 0
                         || cell.character != ' '
                         || !cell.combining.is_empty()
+                        || cell.glyph.is_some()
                         || self.cells[index - 1].continuation
                         || self.cells[index - 1].width != 2
                         || self.cells[index - 1].attributes != cell.attributes
@@ -1784,14 +2213,16 @@ impl Screen {
                     {
                         return Err(TerminalError::MalformedSnapshot);
                     }
-                } else if scalar_width(cell.character) == 0
-                    || cell.width != grapheme_width(cell.character, &cell.combining)
-                    || cell.character.is_control()
-                    || cell.grapheme_bytes() > MAX_GRAPHEME_BYTES
-                    || (cell.width == 2
-                        && (column + 1 >= self.columns || !self.cells[index + 1].continuation))
-                    || !valid_combining_text(&cell.combining)
+                } else if !self.width_profile.valid_grapheme(
+                    cell.character,
+                    &cell.combining,
+                    cell.width,
+                ) || (cell.width == 2
+                    && (column + 1 >= self.columns || !self.cells[index + 1].continuation))
                 {
+                    return Err(TerminalError::MalformedSnapshot);
+                }
+                if cell.glyph.is_some() && (cell.width != 1 || !cell.combining.is_empty()) {
                     return Err(TerminalError::MalformedSnapshot);
                 }
                 if column >= meaningful_end
@@ -1800,6 +2231,7 @@ impl Screen {
                         || !cell.combining.is_empty()
                         || cell.width != 1
                         || cell.protected
+                        || cell.glyph.is_some()
                         || cell.hyperlink.is_some())
                 {
                     return Err(TerminalError::MalformedSnapshot);
@@ -1840,18 +2272,20 @@ impl Screen {
         let first_row = usize::try_from(first_row).expect("bounded row").max(1);
         for row in first_row..self.row_metadata.len() {
             if self.soft_wrapped[row - 1] {
-                self.row_metadata[row] = RowMetadata::continuation_of(
+                let metadata = RowMetadata::continuation_of(
                     self.row_metadata[row - 1],
                     self.meaningful_end[row - 1],
                 );
+                self.set_row_metadata(row, metadata);
             }
         }
     }
 
     fn refresh_continuation_metadata(&mut self, mut row: usize) {
         while row + 1 < self.row_metadata.len() && self.soft_wrapped[row] {
-            self.row_metadata[row + 1] =
+            let metadata =
                 RowMetadata::continuation_of(self.row_metadata[row], self.meaningful_end[row]);
+            self.set_row_metadata(row + 1, metadata);
             row += 1;
         }
     }
@@ -1943,6 +2377,21 @@ impl Screen {
         upward: bool,
         blank_attributes: Attributes,
     ) {
+        let stored_top = self.viewport_top();
+        if let Some(changes) = &mut self.graphic_scrolls {
+            changes.push(GraphicScroll {
+                top: stored_top + rectangle.top,
+                bottom: stored_top + rectangle.bottom,
+                left: rectangle.left,
+                right: rectangle.right,
+                delta: if upward {
+                    -(count as i32)
+                } else {
+                    count as i32
+                },
+                trimmed: 0,
+            });
+        }
         let left = usize::try_from(rectangle.left).expect("bounded rectangle column");
         let right = usize::try_from(rectangle.right).expect("bounded rectangle column");
         let height = rectangle.bottom - rectangle.top;
@@ -2028,6 +2477,47 @@ impl Screen {
         );
     }
 
+    // Graphics-profile rectangle edits materialize styled padding so reflow retains it.
+    // Legacy profiles keep their existing rectangle-edit serialization behavior.
+    pub(super) fn retain_rectangle_rendition_padding(
+        &mut self,
+        top: u32,
+        left: u32,
+        bottom: u32,
+        right: u32,
+        rectangle_extent: bool,
+    ) {
+        if !rectangle_extent {
+            return;
+        }
+        let Some(rectangle) = self.clipped_rectangle(top, left, bottom, right) else {
+            return;
+        };
+        for row in rectangle.top..rectangle.bottom {
+            let row_start = self.visible_cell_index(row, 0);
+            let row_end = row_start + usize::try_from(self.columns).expect("bounded columns");
+            let (start, end) = expanded_rectangle_columns(
+                &self.cells[row_start..row_end],
+                rectangle.left,
+                rectangle.right,
+            );
+            let end = end.min(self.line_columns(row) as usize);
+            let start = start.min(end);
+            let Some(styled_column) = self.cells[row_start + start..row_start + end]
+                .iter()
+                .rposition(|cell| cell.attributes != Attributes::default())
+            else {
+                continue;
+            };
+            let styled_end = u32::try_from(start + styled_column + 1).expect("bounded column");
+            let stored_row = self.visible_row_index(row);
+            if styled_end > self.meaningful_end[stored_row] {
+                self.meaningful_end[stored_row] = styled_end;
+                self.refresh_continuation_metadata(stored_row);
+            }
+        }
+    }
+
     fn transform_attribute_span(
         &mut self,
         row_index: u32,
@@ -2103,6 +2593,9 @@ impl Screen {
         let bottom = usize::try_from(stored_bottom).expect("bounded row");
         let count = usize::try_from(count).expect("bounded row count");
         self.soft_wrapped[top..bottom].rotate_left(count);
+        self.graphic_geometry_changed();
+        self.line_renditions[top..bottom].rotate_left(count);
+        self.line_renditions[bottom - count..bottom].fill(LineRendition::SingleWidth);
         self.meaningful_end[top..bottom].rotate_left(count);
         self.row_metadata[top..bottom].rotate_left(count);
         self.soft_wrapped[bottom - count..bottom].fill(false);
@@ -2123,6 +2616,16 @@ impl Screen {
             self.row_metadata[bottom] = RowMetadata::line_head(logical_line_id);
         }
         self.normalize_row_metadata();
+        if let Some(changes) = &mut self.graphic_scrolls {
+            changes.push(GraphicScroll {
+                top: stored_top,
+                bottom: stored_bottom,
+                left: 0,
+                right: self.columns,
+                delta: -(count as i32),
+                trimmed: 0,
+            });
+        }
         true
     }
 
@@ -2172,6 +2675,9 @@ impl Screen {
         let bottom = usize::try_from(stored_bottom).expect("bounded row");
         let count = usize::try_from(count).expect("bounded row count");
         self.soft_wrapped[top..bottom].rotate_right(count);
+        self.graphic_geometry_changed();
+        self.line_renditions[top..bottom].rotate_right(count);
+        self.line_renditions[top..top + count].fill(LineRendition::SingleWidth);
         self.meaningful_end[top..bottom].rotate_right(count);
         self.row_metadata[top..bottom].rotate_right(count);
         self.soft_wrapped[top..top + count].fill(false);
@@ -2188,6 +2694,16 @@ impl Screen {
             self.row_metadata[bottom] = RowMetadata::line_head(logical_line_id);
         }
         self.normalize_row_metadata();
+        if let Some(changes) = &mut self.graphic_scrolls {
+            changes.push(GraphicScroll {
+                top: stored_top,
+                bottom: stored_bottom,
+                left: 0,
+                right: self.columns,
+                delta: count as i32,
+                trimmed: 0,
+            });
+        }
         true
     }
 
@@ -2227,12 +2743,27 @@ impl Screen {
             blank_meaningful_end,
             usize::try_from(count).expect("bounded row count"),
         ));
+        self.graphic_geometry_changed();
         self.row_metadata.extend(blank_metadata);
+        self.line_renditions.extend(std::iter::repeat_n(
+            LineRendition::SingleWidth,
+            count as usize,
+        ));
         self.scrollback_generation_rows = self
             .scrollback_generation_rows
             .saturating_add(u64::from(count));
         debug_assert_eq!(self.viewport_top(), retained_history);
         debug_assert!(self.cells.len() <= self.storage_policy().cell_cap);
+        if let Some(changes) = &mut self.graphic_scrolls {
+            changes.push(GraphicScroll {
+                top: 0,
+                bottom: 0,
+                left: 0,
+                right: self.columns,
+                delta: 0,
+                trimmed: drop_rows,
+            });
+        }
         true
     }
 
@@ -2240,6 +2771,7 @@ impl Screen {
         if rows == 0 {
             return;
         }
+        self.graphic_geometry_changed();
         let rows = usize::try_from(rows).expect("bounded row count");
         let first_kept_id = self.row_metadata[rows].logical_line_id;
         let truncated_head = self.row_metadata[..rows]
@@ -2248,6 +2780,7 @@ impl Screen {
         let cells = rows * usize::try_from(self.columns).expect("bounded columns");
         self.cells.drain(..cells);
         self.soft_wrapped.drain(..rows);
+        self.line_renditions.drain(..rows);
         self.meaningful_end.drain(..rows);
         self.row_metadata.drain(..rows);
         if truncated_head {
@@ -2285,6 +2818,13 @@ impl Screen {
         cause: ScrollCause,
     ) -> bool {
         self.prepare_for_mutation();
+        let soft_wrap = soft_wrap
+            && self.line_renditions[self.visible_row_index(self.cursor_row)]
+                == LineRendition::SingleWidth
+            && (self.cursor_row + 1 == bottom
+                || self.cursor_row + 1 < self.rows
+                    && self.line_renditions[self.visible_row_index(self.cursor_row + 1)]
+                        == LineRendition::SingleWidth);
         let row = self.visible_row_index(self.cursor_row);
         let continuation = RowMetadata::continuation_of(
             self.visible_row_metadata(self.cursor_row),
@@ -2303,12 +2843,13 @@ impl Screen {
         };
         self.soft_wrapped[row] = soft_wrap;
         self.wrap_pending = false;
+        let captures_history = scrolls_region
+            && cause.output_revision().is_some()
+            && top == 0
+            && bottom == self.rows
+            && self.history_capacity() > 0;
         if scrolls_region {
-            let shifted = if cause.output_revision().is_some()
-                && top == 0
-                && bottom == self.rows
-                && self.history_capacity() > 0
-            {
+            let shifted = if captures_history {
                 self.capture_full_viewport_scroll(1)
             } else {
                 self.shift_rows_up(top, bottom, 1)
@@ -2321,15 +2862,21 @@ impl Screen {
             self.cursor_row += 1;
         }
         let cursor_row = self.visible_row_index(self.cursor_row);
+        if captures_history && soft_wrap && cursor_row > 0 {
+            // Explicit scroll starts a blank line, but autowrap continues the
+            // prior bottom row after it moves. Its logical ID must not seal yet.
+            self.soft_wrapped[cursor_row - 1] = true;
+        }
         if let Some((split_row, logical_line_id)) = split_line {
-            self.row_metadata[split_row] = RowMetadata::line_head(logical_line_id);
+            self.set_row_metadata(split_row, RowMetadata::line_head(logical_line_id));
         } else if soft_wrap && cursor_row > 0 && self.soft_wrapped[cursor_row - 1] {
-            *self.visible_row_metadata_mut(self.cursor_row) = continuation;
+            self.set_row_metadata(self.visible_row_index(self.cursor_row), continuation);
         }
         self.normalize_row_metadata_from(self.viewport_top());
         if let Some(revision) = cause.output_revision() {
             self.seal_history(revision);
         }
+        self.canonicalize_cursor_cells();
         true
     }
 
@@ -2382,13 +2929,13 @@ impl Screen {
             }
             self.cursor_row += 1;
             if !inside_rectangle && soft_wrap {
-                *self.visible_row_metadata_mut(self.cursor_row) = continuation;
+                self.set_row_metadata(self.visible_row_index(self.cursor_row), continuation);
             }
         } else {
             self.soft_wrapped[source_row] = false;
         }
         if let Some(logical_line_id) = split_line_id {
-            self.row_metadata[source_row + 1] = RowMetadata::line_head(logical_line_id);
+            self.set_row_metadata(source_row + 1, RowMetadata::line_head(logical_line_id));
         }
         self.normalize_row_metadata_from(self.viewport_top());
         true
@@ -2502,7 +3049,15 @@ impl Screen {
             }
             let grapheme = self.cells[index].clone();
             self.clear_grapheme_at(row, column);
-            if !self.line_feed_in_rectangle_with_wrap(true, top, bottom, left, right, scroll_cause)
+            if row == self.cursor_row
+                && !self.line_feed_in_rectangle_with_wrap(
+                    true,
+                    top,
+                    bottom,
+                    left,
+                    right,
+                    scroll_cause,
+                )
             {
                 return Err(TerminalError::LimitExceeded);
             }
@@ -2532,6 +3087,9 @@ impl Screen {
             let row_index = self.visible_row_index(row);
             self.meaningful_end[row_index] = self.meaningful_end[row_index].max(column + 2);
             self.refresh_continuation_metadata(row_index);
+            if row != self.cursor_row {
+                return Ok(());
+            }
             if column + 2 >= line_right {
                 self.cursor_column = line_right - 1;
                 self.wrap_pending = auto_wrap;
@@ -2554,7 +3112,7 @@ impl Screen {
             == Some('\u{200d}')
     }
 
-    fn previous_lead_index(
+    pub(super) fn previous_lead_index(
         &self,
         auto_wrap: bool,
         line_left: u32,
@@ -2639,6 +3197,7 @@ impl Screen {
 
     fn repair_all_rows(&mut self) {
         for row in 0..self.stored_rows() {
+            self.crop_scaled_row(row as usize);
             let mut column = 0;
             while column < self.columns {
                 let index = cell_index(self.columns, row, column);
@@ -2670,6 +3229,10 @@ impl Screen {
     }
 
     pub(super) fn canonicalize_cursor_cells(&mut self) {
+        self.cursor_column = self
+            .cursor_column
+            .min(self.line_columns(self.cursor_row) - 1);
+        self.saved.column = self.saved.column.min(self.line_columns(self.saved.row) - 1);
         if !self.wrap_pending {
             self.snap_cursor_from_continuation();
         }
@@ -2682,6 +3245,9 @@ impl Screen {
     }
 
     fn snap_cursor_from_continuation(&mut self) {
+        self.cursor_column = self
+            .cursor_column
+            .min(self.line_columns(self.cursor_row) - 1);
         let index = self.visible_cell_index(self.cursor_row, self.cursor_column);
         if self.cells[index].continuation {
             self.cursor_column -= 1;
@@ -2716,6 +3282,7 @@ impl Screen {
             current.get_or_insert_with(|| {
                 let metadata = self.row_metadata[row_index];
                 LogicalLine {
+                    rendition: self.line_renditions[row_index],
                     metadata,
                     cells: Vec::new(),
                     old_width: metadata.logical_cell_offset,
@@ -2741,6 +3308,12 @@ impl Screen {
                     .into_iter()
                     .filter(|position| position.logical_line_id == line.metadata.logical_line_id)
                     .map(|position| position.logical_cell_offset)
+                    .chain(
+                        self.graphic_reflow_anchors
+                            .iter()
+                            .filter(|(id, _)| *id == line.metadata.logical_line_id)
+                            .map(|(_, offset)| offset.saturating_add(1)),
+                    )
                     .max()
                     .unwrap_or(0);
                 while line.old_width < preserve {
@@ -2759,6 +3332,7 @@ impl Screen {
         if lines.is_empty() {
             let metadata = self.row_metadata[0];
             lines.push(LogicalLine {
+                rendition: LineRendition::SingleWidth,
                 metadata,
                 cells: Vec::new(),
                 old_width: metadata.logical_cell_offset,
@@ -2868,6 +3442,7 @@ impl LineLayout {
 
 fn layout_line(line: &LogicalLine, columns: u32) -> Result<LineLayout, TerminalError> {
     let width = usize::try_from(columns).expect("bounded columns");
+    let columns = line.rendition.columns(columns);
     let mut rows = vec![vec![Cell::default(); width]];
     let mut meaningful_end = vec![0];
     let mut row_metadata = vec![line.metadata];
@@ -2883,6 +3458,9 @@ fn layout_line(line: &LogicalLine, columns: u32) -> Result<LineLayout, TerminalE
         }
         let cell_width = u32::from(reflow_cell.width);
         if wrap || column + cell_width > columns {
+            if line.rendition != LineRendition::SingleWidth {
+                break;
+            }
             row += 1;
             column = 0;
             wrap = false;
@@ -2937,23 +3515,6 @@ fn window_anchored_position(
     } else {
         (position.0 - dropped_rows, position.1, position.2)
     }
-}
-
-fn valid_combining_text(text: &str) -> bool {
-    let mut joined = false;
-    for character in text.chars() {
-        if character.is_control() && character != '\u{200d}' {
-            return false;
-        }
-        if scalar_width(character) == 0 {
-            joined = character == '\u{200d}';
-        } else if joined && scalar_width(character) == 2 {
-            joined = false;
-        } else {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -3025,6 +3586,8 @@ mod tests {
             right,
             None,
             ScrollCause::Ordinary,
+            false,
+            true,
         )
     }
 
@@ -3100,6 +3663,65 @@ mod tests {
         );
         assert_eq!(screen.clone().row_metadata, screen.row_metadata);
         screen.validate().expect("initial row layout is canonical");
+    }
+
+    #[test]
+    fn validation_checks_unique_line_heads_and_preserves_continuation_rules() {
+        let mut screen = Screen::new(4, 5);
+        screen.soft_wrapped[1] = true;
+        screen.meaningful_end[1] = 1;
+        screen.row_metadata[2] = RowMetadata::continuation_of(screen.row_metadata[1], 1);
+        screen
+            .validate()
+            .expect("one continued logical line is valid");
+
+        for earlier_head in [0, 1] {
+            let mut duplicate = screen.clone();
+            duplicate.row_metadata[4].logical_line_id =
+                screen.row_metadata[earlier_head].logical_line_id;
+            assert_eq!(duplicate.validate(), Err(TerminalError::MalformedSnapshot));
+        }
+        let mut wrong_offset = screen.clone();
+        wrong_offset.row_metadata[2].logical_cell_offset += 1;
+        assert_eq!(
+            wrong_offset.validate(),
+            Err(TerminalError::MalformedSnapshot)
+        );
+        let mut wrong_revision = screen.clone();
+        wrong_revision.row_metadata[2].sealed_revision = 1;
+        assert_eq!(
+            wrong_revision.validate(),
+            Err(TerminalError::MalformedSnapshot)
+        );
+        let mut wrong_flags = screen;
+        wrong_flags.row_metadata[2].flags = ROW_FLAG_HEAD_TRUNCATED;
+        assert_eq!(
+            wrong_flags.validate(),
+            Err(TerminalError::MalformedSnapshot)
+        );
+    }
+
+    #[test]
+    fn validation_keeps_history_and_viewport_head_checks_distinct_from_window_projection() {
+        let mut screen = Screen::new_with_history_capacity(4, 3, 4, MAX_CELLS);
+        screen.scroll_up_region_with_cause(1, 0, 3, ScrollCause::Output(1));
+        assert_eq!(screen.viewport_top(), 1);
+        screen.validate().expect("history-backed screen is valid");
+
+        let mut duplicate = screen.clone();
+        duplicate.row_metadata[3].logical_line_id = screen.row_metadata[0].logical_line_id;
+        assert_eq!(duplicate.validate(), Err(TerminalError::MalformedSnapshot));
+        duplicate
+            .render_window(0)
+            .validate()
+            .expect("window excludes hidden history");
+
+        duplicate.row_metadata[3].logical_line_id = screen.row_metadata[1].logical_line_id;
+        assert_eq!(duplicate.validate(), Err(TerminalError::MalformedSnapshot));
+        assert_eq!(
+            duplicate.render_window(0).validate(),
+            Err(TerminalError::MalformedSnapshot)
+        );
     }
 
     #[test]
@@ -4422,6 +5044,33 @@ mod tests {
         from_continuation
             .validate()
             .expect("continuation-boundary fill is canonical");
+    }
+
+    #[test]
+    fn rectangle_padding_retention_skips_default_stream_and_hidden_rendition_cells() {
+        let mut screen = Screen::new(8, 2);
+        screen.change_rectangle_attributes(0, 0, 2, 8, RectangleAttributeChange::default());
+        screen.retain_rectangle_rendition_padding(0, 0, 2, 8, true);
+        assert_eq!(screen.meaningful_end, [0, 0]);
+
+        let bold = RectangleAttributeChange {
+            bold: Some(true),
+            ..RectangleAttributeChange::default()
+        };
+        screen.change_rectangle_attributes_with_extent(0, 0, 2, 8, bold, false);
+        screen.retain_rectangle_rendition_padding(0, 0, 2, 8, false);
+        assert_eq!(screen.meaningful_end, [0, 0]);
+
+        screen
+            .set_line_rendition(LineRendition::DoubleWidth)
+            .unwrap();
+        screen.change_rectangle_attributes(0, 6, 1, 8, bold);
+        screen.retain_rectangle_rendition_padding(0, 6, 1, 8, true);
+        assert_eq!(screen.meaningful_end, [0, 0]);
+        screen.change_rectangle_attributes(0, 2, 1, 8, bold);
+        screen.retain_rectangle_rendition_padding(0, 2, 1, 8, true);
+        assert_eq!(screen.meaningful_end, [4, 0]);
+        screen.validate().unwrap();
     }
 
     #[test]

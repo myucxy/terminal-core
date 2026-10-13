@@ -1,10 +1,21 @@
 //! Hardened C ABI for the TermLink terminal core.
+mod broker;
+mod delta;
+mod history;
+mod input_diagnostic;
+mod projection;
+pub use broker::*;
+pub use delta::*;
+pub use history::*;
+pub use projection::*;
 
 use std::collections::HashMap;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
+use termlink_terminal_core::MAX_GRAPHICS_SNAPSHOT_BYTES;
+use termlink_terminal_core::render_frame_v5::MAX_RENDER_FRAME_V5_BYTES;
 
 use termlink_terminal_core::{
     CellPosition, Event, HOST_EFFECT_FRAME_V1_FORMAT_VERSION, HOST_EFFECT_FRAME_V2_FORMAT_VERSION,
@@ -12,11 +23,12 @@ use termlink_terminal_core::{
     KittyKeyEvent, KittyKeyEventType, KittyModifiers, MAX_HOST_EFFECT_FRAME_V1_BYTES,
     MAX_HOST_EFFECT_FRAME_V2_BYTES, MAX_KITTY_ASSOCIATED_TEXT_BYTES, MAX_OUTPUT_BYTES,
     MAX_PASTE_BYTES, MAX_RENDER_FRAME_V1_BYTES, MAX_RENDER_FRAME_V2_BYTES,
-    MAX_RENDER_FRAME_V3_BYTES, MAX_SNAPSHOT_BYTES, Modifiers, MouseAction, MouseButton,
-    MouseButtons, MouseEvent, MousePosition, MouseWheelDirection, OutputProfile, PasteEvent,
-    PixelPosition, PreparedApplyWithHostEffectsV1, PreparedApplyWithHostEffectsV2,
-    RENDER_FRAME_V1_FORMAT_VERSION, RENDER_FRAME_V2_FORMAT_VERSION, RENDER_FRAME_V3_FORMAT_VERSION,
-    Terminal, TerminalError, TerminalOptions, Win32KeyEvent,
+    MAX_RENDER_FRAME_V3_BYTES, MAX_RENDER_FRAME_V4_BYTES, MAX_SNAPSHOT_BYTES, Modifiers,
+    MouseAction, MouseButton, MouseButtons, MouseEvent, MousePosition, MouseWheelDirection,
+    OutputProfile, PasteEvent, PixelPosition, PreparedApplyWithHostEffectsV1,
+    PreparedApplyWithHostEffectsV2, RENDER_FRAME_V1_FORMAT_VERSION, RENDER_FRAME_V2_FORMAT_VERSION,
+    RENDER_FRAME_V3_FORMAT_VERSION, RENDER_FRAME_V4_FORMAT_VERSION, Terminal, TerminalError,
+    TerminalOptions, WidthProfile, Win32KeyEvent,
 };
 
 pub const ABI_VERSION: u32 = 1;
@@ -36,6 +48,7 @@ pub const STATUS_TIME_OVERFLOW: u32 = 11;
 pub const STATUS_SNAPSHOT_NOT_ELIGIBLE: u32 = 12;
 pub const STATUS_PRESENTATION_DEFERRED: u32 = 13;
 pub const STATUS_HOST_EFFECT_VERSION_REQUIRED: u32 = 14;
+pub const STATUS_RENDER_FRAME_VERSION_REQUIRED: u32 = 15;
 pub const STATUS_PANIC: u32 = 255;
 
 pub const PRESENTATION_FLAG_FAILED_CLOSED: u32 = 1;
@@ -46,6 +59,8 @@ pub const EVENT_OUTPUT: u32 = 1;
 pub const EVENT_RESIZE: u32 = 2;
 pub const EVENT_ADVANCE: u32 = 3;
 pub const EVENT_GAP: u32 = 4;
+pub const EVENT_HOST_GEOMETRY_V1: u32 = 5;
+pub const EVENT_HOST_THEME_V1: u32 = 6;
 
 pub const INPUT_KIND_KEY: u32 = 1;
 pub const INPUT_KIND_PASTE: u32 = 2;
@@ -165,11 +180,13 @@ const MAX_EVENT_BATCH_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 #[repr(C)]
 pub struct TlTerminal {
     inner: Terminal,
+    history_owner: u64,
 }
 
 #[repr(C)]
 pub struct TlTerminalCheckpoint {
     frozen_terminal: Terminal,
+    history_owner: u64,
     revision: u64,
     next_source_sequence: u64,
     #[cfg(test)]
@@ -219,6 +236,25 @@ pub struct TlTerminalConfigV3 {
     pub reserved_v2_compat: [u64; 2],
     pub output_profile: u32,
     pub reserved0: u32,
+    pub reserved: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TlTerminalConfigV4 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub columns: u32,
+    pub rows: u32,
+    pub initial_source_sequence: u64,
+    pub reserved_v1_compat: [u64; 2],
+    pub history_capacity_rows: u64,
+    pub reserved_v2_compat: [u64; 2],
+    pub output_profile: u32,
+    pub reserved0: u32,
+    pub reserved_v3_compat: [u64; 2],
+    pub width_profile: u32,
+    pub reserved1: u32,
     pub reserved: [u64; 2],
 }
 
@@ -369,6 +405,9 @@ const _: () = {
     assert!(mem::size_of::<TlTerminalConfigV1>() == 40);
     assert!(mem::size_of::<TlTerminalConfigV2>() == 64);
     assert!(mem::size_of::<TlTerminalConfigV3>() == 88);
+    assert!(mem::size_of::<TlTerminalConfigV4>() == 112);
+    assert!(mem::offset_of!(TlTerminalConfigV4, width_profile) == 88);
+    assert!(mem::offset_of!(TlTerminalConfigV4, reserved) == 96);
     assert!(mem::offset_of!(TlTerminalConfigV3, initial_source_sequence) == 16);
     assert!(mem::offset_of!(TlTerminalConfigV3, reserved_v1_compat) == 24);
     assert!(mem::offset_of!(TlTerminalConfigV3, history_capacity_rows) == 40);
@@ -431,6 +470,21 @@ pub extern "C" fn tl_terminal_max_snapshot_bytes() -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn tl_terminal_max_graphics_snapshot_bytes() -> u64 {
+    MAX_GRAPHICS_SNAPSHOT_BYTES as u64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tl_terminal_render_frame_v5_format_version() -> u32 {
+    5
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tl_terminal_render_frame_v5_max_bytes() -> u64 {
+    MAX_RENDER_FRAME_V5_BYTES as u64
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tl_terminal_render_frame_v1_format_version() -> u32 {
     catch_unwind(|| RENDER_FRAME_V1_FORMAT_VERSION).unwrap_or(0)
 }
@@ -465,6 +519,19 @@ pub extern "C" fn tl_terminal_render_frame_v3_format_version() -> u32 {
 pub extern "C" fn tl_terminal_render_frame_v3_max_bytes() -> u64 {
     catch_unwind(|| {
         u64::try_from(MAX_RENDER_FRAME_V3_BYTES).expect("maximum render frame size fits in u64")
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tl_terminal_render_frame_v4_format_version() -> u32 {
+    catch_unwind(|| RENDER_FRAME_V4_FORMAT_VERSION).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tl_terminal_render_frame_v4_max_bytes() -> u64 {
+    catch_unwind(|| {
+        u64::try_from(MAX_RENDER_FRAME_V4_BYTES).expect("maximum render frame size fits in u64")
     })
     .unwrap_or(0)
 }
@@ -510,6 +577,11 @@ pub extern "C" fn tl_terminal_config_v2_struct_size() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tl_terminal_config_v3_struct_size() -> u32 {
     catch_struct_size::<TlTerminalConfigV3>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tl_terminal_config_v4_struct_size() -> u32 {
+    catch_struct_size::<TlTerminalConfigV4>()
 }
 
 #[unsafe(no_mangle)]
@@ -587,7 +659,10 @@ pub unsafe extern "C" fn tl_terminal_create(
             config.initial_source_sequence,
         ) {
             Ok(inner) => {
-                let terminal = Box::into_raw(Box::new(TlTerminal { inner }));
+                let terminal = Box::into_raw(Box::new(TlTerminal {
+                    inner,
+                    history_owner: history::new_owner_id(),
+                }));
                 // SAFETY: The output was validated above and remains writable.
                 unsafe { ptr::write_unaligned(out_terminal, terminal) };
                 STATUS_OK
@@ -637,7 +712,10 @@ pub unsafe extern "C" fn tl_terminal_create_v2(
             },
         ) {
             Ok(inner) => {
-                let terminal = Box::into_raw(Box::new(TlTerminal { inner }));
+                let terminal = Box::into_raw(Box::new(TlTerminal {
+                    inner,
+                    history_owner: history::new_owner_id(),
+                }));
                 // SAFETY: The output was validated above and remains writable.
                 unsafe { ptr::write_unaligned(out_terminal, terminal) };
                 STATUS_OK
@@ -697,7 +775,104 @@ pub unsafe extern "C" fn tl_terminal_create_v3(
             output_profile,
         ) {
             Ok(inner) => {
-                let terminal = Box::into_raw(Box::new(TlTerminal { inner }));
+                let terminal = Box::into_raw(Box::new(TlTerminal {
+                    inner,
+                    history_owner: history::new_owner_id(),
+                }));
+                // SAFETY: The output was validated above and remains writable.
+                unsafe { ptr::write_unaligned(out_terminal, terminal) };
+                STATUS_OK
+            }
+            Err(error) => status_for_error(&error),
+        }
+    })
+}
+
+/// Creates a terminal with a frozen width profile; requires exact V4 size.
+///
+/// # Safety
+/// The pointer and ownership contract is identical to `tl_terminal_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_create_v4(
+    config: *const TlTerminalConfigV4,
+    out_terminal: *mut *mut TlTerminal,
+) -> u32 {
+    // SAFETY: The public contract is forwarded unchanged.
+    unsafe { create_with_v4_config(config, out_terminal, false) }
+}
+
+/// Explicitly creates the experimental graphics profile using exact Config V4.
+/// # Safety
+/// The pointer and ownership contract is identical to `tl_terminal_create_v4`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_create_graphics_v1(
+    config: *const TlTerminalConfigV4,
+    out_terminal: *mut *mut TlTerminal,
+) -> u32 {
+    // SAFETY: The public contract is forwarded unchanged.
+    unsafe { create_with_v4_config(config, out_terminal, true) }
+}
+
+unsafe fn create_with_v4_config(
+    config: *const TlTerminalConfigV4,
+    out_terminal: *mut *mut TlTerminal,
+    graphics: bool,
+) -> u32 {
+    catch_status(|| {
+        if config.is_null() || out_terminal.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        // SAFETY: The C contract requires a writable pointer-sized output.
+        if let Err(status) = unsafe { require_empty_handle(out_terminal) } {
+            return status;
+        }
+        // SAFETY: The C contract requires a readable versioned configuration.
+        let config = match unsafe { read_versioned_exact(config) } {
+            Ok(config) => config,
+            Err(status) => return status,
+        };
+        if config.reserved_v1_compat != [0; 2]
+            || config.reserved_v2_compat != [0; 2]
+            || config.reserved0 != 0
+            || config.reserved_v3_compat != [0; 2]
+            || config.reserved1 != 0
+            || config.reserved != [0; 2]
+            || config.history_capacity_rows > u64::from(u32::MAX)
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let output_profile = match config.output_profile {
+            OUTPUT_PROFILE_UTF8 => OutputProfile::Utf8,
+            OUTPUT_PROFILE_UTF8_WITH_STANDALONE_C1 => OutputProfile::Utf8WithStandaloneC1,
+            _ => return STATUS_INVALID_ARGUMENT,
+        };
+        let width_profile = match config.width_profile {
+            1 => WidthProfile::LegacyV1,
+            2 => WidthProfile::Unicode16,
+            _ => return STATUS_INVALID_ARGUMENT,
+        };
+        let history_capacity_rows =
+            u32::try_from(config.history_capacity_rows).expect("prevalidated history rows");
+        let create = if graphics {
+            Terminal::new_with_graphics_profile
+        } else {
+            Terminal::new_with_profiles
+        };
+        match create(
+            config.columns,
+            config.rows,
+            config.initial_source_sequence,
+            TerminalOptions {
+                history_capacity_rows,
+            },
+            output_profile,
+            width_profile,
+        ) {
+            Ok(inner) => {
+                let terminal = Box::into_raw(Box::new(TlTerminal {
+                    inner,
+                    history_owner: history::new_owner_id(),
+                }));
                 // SAFETY: The output was validated above and remains writable.
                 unsafe { ptr::write_unaligned(out_terminal, terminal) };
                 STATUS_OK
@@ -1065,6 +1240,7 @@ pub unsafe extern "C" fn tl_terminal_checkpoint_begin(
         let next_source_sequence = terminal.inner.next_source_sequence();
         let checkpoint = Box::into_raw(Box::new(TlTerminalCheckpoint {
             frozen_terminal: terminal.inner.clone(),
+            history_owner: terminal.history_owner,
             revision: next_source_sequence,
             next_source_sequence,
             #[cfg(test)]
@@ -1173,6 +1349,27 @@ pub unsafe extern "C" fn tl_terminal_checkpoint_export_snapshot(
     checkpoint: *const TlTerminalCheckpoint,
     out_snapshot: *mut TlTerminalBuffer,
 ) -> u32 {
+    // SAFETY: The public contract is forwarded unchanged.
+    unsafe { export_snapshot_profile(checkpoint, out_snapshot, false) }
+}
+
+/// Exports only graphics-profile Snapshot 2.22, bounded by 128 MiB.
+/// # Safety
+/// Uses the same live checkpoint and empty output contract as snapshot export.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_checkpoint_export_snapshot_graphics_v1(
+    checkpoint: *const TlTerminalCheckpoint,
+    out_snapshot: *mut TlTerminalBuffer,
+) -> u32 {
+    // SAFETY: The public contract is forwarded unchanged.
+    unsafe { export_snapshot_profile(checkpoint, out_snapshot, true) }
+}
+
+unsafe fn export_snapshot_profile(
+    checkpoint: *const TlTerminalCheckpoint,
+    out_snapshot: *mut TlTerminalBuffer,
+    graphics: bool,
+) -> u32 {
     catch_status(|| {
         if checkpoint.is_null() || out_snapshot.is_null() {
             return STATUS_NULL_POINTER;
@@ -1184,6 +1381,9 @@ pub unsafe extern "C" fn tl_terminal_checkpoint_export_snapshot(
         };
         // SAFETY: The C contract requires the checkpoint to remain live.
         let checkpoint = unsafe { &*checkpoint };
+        if checkpoint.frozen_terminal.has_graphics_profile() != graphics {
+            return STATUS_INCOMPATIBLE_SNAPSHOT;
+        }
         let snapshot = match checkpoint.frozen_terminal.export_snapshot_v2() {
             Ok(snapshot) => snapshot,
             Err(error) => return status_for_error(&error),
@@ -1192,12 +1392,93 @@ pub unsafe extern "C" fn tl_terminal_checkpoint_export_snapshot(
         checkpoint
             .snapshot_export_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let buffer = match owned_buffer(snapshot, capacity) {
+        let limit = if graphics {
+            MAX_GRAPHICS_SNAPSHOT_BYTES
+        } else {
+            MAX_SNAPSHOT_BYTES
+        };
+        let buffer = match owned_buffer_with_limit(snapshot, capacity, limit) {
             Ok(buffer) => buffer,
             Err(status) => return status,
         };
         // SAFETY: The capacity check established writable known fields.
         unsafe { ptr::write_unaligned(out_snapshot, buffer) };
+        STATUS_OK
+    })
+}
+
+/// Exports bounded ASCII diagnostic text, including exact escaped control bytes.
+/// An empty buffer means no output diagnostic. Available after failed-closed.
+///
+/// # Safety
+/// `terminal` must remain live; `out_diagnostic` must be a writable versioned
+/// empty buffer, released by the caller with `tl_terminal_buffer_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_export_failure_diagnostic_v1(
+    terminal: *const TlTerminal,
+    out_diagnostic: *mut TlTerminalBuffer,
+) -> u32 {
+    // SAFETY: Forward the documented pointer contract without changing ownership.
+    unsafe { export_failure_diagnostic(terminal, out_diagnostic, 1) }
+}
+
+/// V2 adds build/profile identity, detection position and actual core impact.
+/// # Safety
+/// Same live terminal and empty owned buffer contract as V1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_export_failure_diagnostic_v2(
+    terminal: *const TlTerminal,
+    out_diagnostic: *mut TlTerminalBuffer,
+) -> u32 {
+    // SAFETY: Forward the documented pointer contract without changing ownership.
+    unsafe { export_failure_diagnostic(terminal, out_diagnostic, 2) }
+}
+
+/// V3 adds separately labeled expanded macro diagnostics (at most 8192 ASCII bytes).
+/// Ordinary failures retain TL-DIAG/2. V1 and V2 remain frozen.
+/// # Safety
+/// Same live terminal and empty owned buffer contract as V1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_export_failure_diagnostic_v3(
+    terminal: *const TlTerminal,
+    out_diagnostic: *mut TlTerminalBuffer,
+) -> u32 {
+    // SAFETY: Forward the documented pointer contract without changing ownership.
+    unsafe { export_failure_diagnostic(terminal, out_diagnostic, 3) }
+}
+
+unsafe fn export_failure_diagnostic(
+    terminal: *const TlTerminal,
+    out_diagnostic: *mut TlTerminalBuffer,
+    version: u8,
+) -> u32 {
+    catch_status(|| {
+        if terminal.is_null() || out_diagnostic.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        // SAFETY: The caller supplies a readable/writable empty output buffer.
+        let capacity = match unsafe { empty_buffer_capacity(out_diagnostic) } {
+            Ok(capacity) => capacity,
+            Err(status) => return status,
+        };
+        // SAFETY: The terminal remains live for this read-only call.
+        let terminal = unsafe { &*terminal };
+        let diagnostic = if version == 3 {
+            terminal.inner.failure_diagnostic_v3()
+        } else if version == 2 {
+            terminal.inner.failure_diagnostic_v2()
+        } else {
+            terminal.inner.failure_diagnostic_v1().map(str::to_owned)
+        };
+        let Some(diagnostic) = diagnostic else {
+            return STATUS_OK;
+        };
+        let buffer = match owned_buffer(diagnostic.as_bytes().to_vec(), capacity) {
+            Ok(buffer) => buffer,
+            Err(status) => return status,
+        };
+        // SAFETY: The validated buffer has space for the known fields.
+        unsafe { ptr::write_unaligned(out_diagnostic, buffer) };
         STATUS_OK
     })
 }
@@ -1399,6 +1680,300 @@ pub unsafe extern "C" fn tl_terminal_checkpoint_export_render_frame_v3_at_scroll
     })
 }
 
+/// Returns bounded, committed host state; partial parser tokens cause no platform action.
+/// # Safety
+/// `terminal` must remain live and not be mutated concurrently. `out_state` must
+/// be a writable, versioned, empty owned buffer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_get_host_signals_v1(
+    terminal: *const TlTerminal,
+    out_state: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| {
+        if terminal.is_null() || out_state.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        // SAFETY: caller supplies readable/writable versioned output storage.
+        let capacity = match unsafe { empty_buffer_capacity(out_state) } {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        // SAFETY: caller guarantees the live handle and serialization.
+        let state = unsafe { &*terminal }.inner.host_signals().encode().to_vec();
+        let buffer = match owned_buffer_with_limit(
+            state,
+            capacity,
+            termlink_terminal_core::HOST_SIGNALS_V1_BYTES,
+        ) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        // SAFETY: output capacity has been checked.
+        unsafe {
+            ptr::write_unaligned(out_state, buffer);
+        }
+        STATUS_OK
+    })
+}
+
+/// Exports the live, committed Shell Integration V1 state without creating a
+/// checkpoint.  An incomplete parser sequence is intentionally not included:
+/// the core only mutates `shell_integration` after a complete OSC 7/133
+/// annotation has been accepted.
+///
+/// # Safety
+///
+/// `terminal` must remain live and not be mutated concurrently. `out_frame`
+/// must be a versioned, writable, empty owned buffer. `max_frame_bytes` must
+/// be in 1..=the library hard maximum. The returned buffer must be released
+/// with `tl_terminal_buffer_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_get_shell_state_v1(
+    terminal: *const TlTerminal,
+    max_frame_bytes: u64,
+    out_frame: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| {
+        if terminal.is_null() || out_frame.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        let requested = match checked_length(
+            max_frame_bytes,
+            termlink_terminal_core::MAX_SHELL_STATE_BYTES,
+        ) {
+            Ok(0) | Err(_) => return STATUS_INVALID_ARGUMENT,
+            Ok(requested) => requested,
+        };
+        // SAFETY: The C contract requires a readable and writable empty output.
+        let capacity = match unsafe { empty_buffer_capacity(out_frame) } {
+            Ok(capacity) => capacity,
+            Err(status) => return status,
+        };
+        // SAFETY: The C contract requires the live terminal to remain valid.
+        // `encode` only reads committed shell integration state; it does not
+        // inspect or advance the parser, so partial controls are not exposed.
+        let terminal = unsafe { &*terminal };
+        let frame = match terminal.inner.shell_integration().encode() {
+            Ok(frame) => frame,
+            Err(error) => return status_for_error(&error),
+        };
+        if frame.len() > requested {
+            return STATUS_LIMIT_EXCEEDED;
+        }
+        let buffer = match owned_buffer_with_limit(
+            frame,
+            capacity,
+            termlink_terminal_core::MAX_SHELL_STATE_BYTES,
+        ) {
+            Ok(buffer) => buffer,
+            Err(status) => return status,
+        };
+        // SAFETY: The capacity check established writable known fields.
+        unsafe { ptr::write_unaligned(out_frame, buffer) };
+        STATUS_OK
+    })
+}
+
+/// Exports one owned Shell Integration V1 state from an immutable checkpoint.
+///
+/// # Safety
+///
+/// `checkpoint` must remain live. `out_frame` must be a versioned, writable,
+/// empty buffer. `max_frame_bytes` must be in 1..=the library hard maximum.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_checkpoint_export_shell_state_v1(
+    checkpoint: *const TlTerminalCheckpoint,
+    max_frame_bytes: u64,
+    out_frame: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| {
+        if checkpoint.is_null() || out_frame.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        let requested = match checked_length(
+            max_frame_bytes,
+            termlink_terminal_core::MAX_SHELL_STATE_BYTES,
+        ) {
+            Ok(0) | Err(_) => return STATUS_INVALID_ARGUMENT,
+            Ok(requested) => requested,
+        };
+        // SAFETY: The C contract requires a readable and writable empty output.
+        let capacity = match unsafe { empty_buffer_capacity(out_frame) } {
+            Ok(capacity) => capacity,
+            Err(status) => return status,
+        };
+        // SAFETY: The C contract requires the checkpoint to remain live.
+        let checkpoint = unsafe { &*checkpoint };
+        let frame = match checkpoint.frozen_terminal.shell_integration().encode() {
+            Ok(frame) => frame,
+            Err(error) => return status_for_error(&error),
+        };
+        if frame.len() > requested {
+            return STATUS_LIMIT_EXCEEDED;
+        }
+        let buffer = match owned_buffer_with_limit(
+            frame,
+            capacity,
+            termlink_terminal_core::MAX_SHELL_STATE_BYTES,
+        ) {
+            Ok(buffer) => buffer,
+            Err(status) => return status,
+        };
+        // SAFETY: The capacity check established writable known fields.
+        unsafe { ptr::write_unaligned(out_frame, buffer) };
+        STATUS_OK
+    })
+}
+
+/// Exports one owned renderer-only Render Frame V4 from an immutable checkpoint.
+///
+/// # Safety
+///
+/// `checkpoint` must remain live. `out_frame` must be a versioned, writable,
+/// empty buffer. `max_frame_bytes` must be in 1..=the library hard maximum.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_checkpoint_export_render_frame_v4(
+    checkpoint: *const TlTerminalCheckpoint,
+    max_frame_bytes: u64,
+    out_frame: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| {
+        if checkpoint.is_null() || out_frame.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        let requested = match checked_length(max_frame_bytes, MAX_RENDER_FRAME_V4_BYTES) {
+            Ok(0) | Err(_) => return STATUS_INVALID_ARGUMENT,
+            Ok(requested) => requested,
+        };
+        // SAFETY: The C contract requires a readable and writable empty output.
+        let capacity = match unsafe { empty_buffer_capacity(out_frame) } {
+            Ok(capacity) => capacity,
+            Err(status) => return status,
+        };
+        // SAFETY: The C contract requires the checkpoint to remain live.
+        let checkpoint = unsafe { &*checkpoint };
+        let frame = match checkpoint.frozen_terminal.export_render_frame_v4() {
+            Ok(frame) => frame,
+            Err(error) => return status_for_error(&error),
+        };
+        if frame.len() > requested {
+            return STATUS_LIMIT_EXCEEDED;
+        }
+        let buffer = match owned_buffer_with_limit(frame, capacity, MAX_RENDER_FRAME_V4_BYTES) {
+            Ok(buffer) => buffer,
+            Err(status) => return status,
+        };
+        // SAFETY: The capacity check established writable known fields.
+        unsafe { ptr::write_unaligned(out_frame, buffer) };
+        STATUS_OK
+    })
+}
+
+/// Exports one owned renderer-only Render Frame V4 at a retained scrollback
+/// offset. Offsets beyond the oldest retained row clamp to that boundary.
+///
+/// # Safety
+///
+/// `checkpoint` must remain live. `out_frame` must be a versioned, writable,
+/// empty buffer. `max_frame_bytes` must be in 1..=the library hard maximum.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_checkpoint_export_render_frame_v4_at_scrollback(
+    checkpoint: *const TlTerminalCheckpoint,
+    offset_rows: u32,
+    max_frame_bytes: u64,
+    out_frame: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| {
+        if checkpoint.is_null() || out_frame.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        let requested = match checked_length(max_frame_bytes, MAX_RENDER_FRAME_V4_BYTES) {
+            Ok(0) | Err(_) => return STATUS_INVALID_ARGUMENT,
+            Ok(requested) => requested,
+        };
+        // SAFETY: The C contract requires a readable and writable empty output.
+        let capacity = match unsafe { empty_buffer_capacity(out_frame) } {
+            Ok(capacity) => capacity,
+            Err(status) => return status,
+        };
+        // SAFETY: The C contract requires the checkpoint to remain live.
+        let checkpoint = unsafe { &*checkpoint };
+        let frame = match checkpoint
+            .frozen_terminal
+            .export_render_frame_v4_at_scrollback(offset_rows)
+        {
+            Ok(frame) => frame,
+            Err(error) => return status_for_error(&error),
+        };
+        if frame.len() > requested {
+            return STATUS_LIMIT_EXCEEDED;
+        }
+        let buffer = match owned_buffer_with_limit(frame, capacity, MAX_RENDER_FRAME_V4_BYTES) {
+            Ok(buffer) => buffer,
+            Err(status) => return status,
+        };
+        // SAFETY: The capacity check established writable known fields.
+        unsafe { ptr::write_unaligned(out_frame, buffer) };
+        STATUS_OK
+    })
+}
+
+/// Exports renderer-only V5 for graphics or text profiles. Flags must be zero.
+/// # Safety
+/// `checkpoint` must remain live; `out_frame` must be writable, versioned and empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_checkpoint_export_render_frame_v5(
+    checkpoint: *const TlTerminalCheckpoint,
+    flags: u32,
+    out_frame: *mut TlTerminalBuffer,
+) -> u32 {
+    // SAFETY: The public contract is forwarded unchanged.
+    unsafe {
+        tl_terminal_checkpoint_export_render_frame_v5_at_scrollback(checkpoint, 0, flags, out_frame)
+    }
+}
+
+/// Exports renderer-only V5 at a clamped retained scrollback offset.
+/// # Safety
+/// `checkpoint` must remain live; `out_frame` must be writable, versioned and empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_checkpoint_export_render_frame_v5_at_scrollback(
+    checkpoint: *const TlTerminalCheckpoint,
+    offset_rows: u32,
+    flags: u32,
+    out_frame: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| {
+        if checkpoint.is_null() || out_frame.is_null() {
+            return STATUS_NULL_POINTER;
+        }
+        if flags != 0 {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: The caller provides a readable and writable empty output.
+        let capacity = match unsafe { empty_buffer_capacity(out_frame) } {
+            Ok(capacity) => capacity,
+            Err(status) => return status,
+        };
+        // SAFETY: The caller keeps the checkpoint live.
+        let checkpoint = unsafe { &*checkpoint };
+        let frame = match checkpoint
+            .frozen_terminal
+            .export_render_frame_v5(offset_rows)
+        {
+            Ok(frame) => frame,
+            Err(error) => return status_for_error(&error),
+        };
+        let buffer = match owned_buffer_with_limit(frame, capacity, MAX_RENDER_FRAME_V5_BYTES) {
+            Ok(buffer) => buffer,
+            Err(status) => return status,
+        };
+        // SAFETY: The checked empty buffer receives unique ownership.
+        unsafe { ptr::write_unaligned(out_frame, buffer) };
+        STATUS_OK
+    })
+}
+
 /// Imports a terminal from a canonical Snapshot V2 byte region.
 ///
 /// # Safety
@@ -1411,6 +1986,29 @@ pub unsafe extern "C" fn tl_terminal_import_snapshot(
     snapshot_len: u64,
     out_terminal: *mut *mut TlTerminal,
 ) -> u32 {
+    // SAFETY: The public contract is forwarded unchanged.
+    unsafe { import_snapshot_profile(snapshot, snapshot_len, out_terminal, false) }
+}
+
+/// Imports only experimental graphics-profile Snapshot 2.22, never migrates text profiles.
+/// # Safety
+/// Uses the same borrowed bytes and empty output contract as snapshot import.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_import_snapshot_graphics_v1(
+    snapshot: *const u8,
+    snapshot_len: u64,
+    out_terminal: *mut *mut TlTerminal,
+) -> u32 {
+    // SAFETY: The public contract is forwarded unchanged.
+    unsafe { import_snapshot_profile(snapshot, snapshot_len, out_terminal, true) }
+}
+
+unsafe fn import_snapshot_profile(
+    snapshot: *const u8,
+    snapshot_len: u64,
+    out_terminal: *mut *mut TlTerminal,
+    graphics: bool,
+) -> u32 {
     catch_status(|| {
         if out_terminal.is_null() {
             return STATUS_NULL_POINTER;
@@ -1419,13 +2017,27 @@ pub unsafe extern "C" fn tl_terminal_import_snapshot(
         if let Err(status) = unsafe { require_empty_handle(out_terminal) } {
             return status;
         }
-        let bytes = match borrowed_bytes(snapshot, snapshot_len, MAX_SNAPSHOT_BYTES) {
+        let limit = if graphics {
+            MAX_GRAPHICS_SNAPSHOT_BYTES
+        } else {
+            MAX_SNAPSHOT_BYTES
+        };
+        let bytes = match borrowed_bytes(snapshot, snapshot_len, limit) {
             Ok(bytes) => bytes,
             Err(status) => return status,
         };
+        // Reject profile mismatch before allocating decoded resources. The core
+        // validates the complete header and profile identifier below.
+        if bytes.len() >= 12 && (bytes[8..12] == [2, 0, 22, 0]) != graphics {
+            return STATUS_INCOMPATIBLE_SNAPSHOT;
+        }
         match Terminal::import_snapshot_v2(bytes) {
+            Ok(inner) if inner.has_graphics_profile() != graphics => STATUS_INCOMPATIBLE_SNAPSHOT,
             Ok(inner) => {
-                let terminal = Box::into_raw(Box::new(TlTerminal { inner }));
+                let terminal = Box::into_raw(Box::new(TlTerminal {
+                    inner,
+                    history_owner: history::new_owner_id(),
+                }));
                 // SAFETY: The output was validated above and remains writable.
                 unsafe { ptr::write_unaligned(out_terminal, terminal) };
                 STATUS_OK
@@ -1460,7 +2072,10 @@ pub unsafe extern "C" fn tl_terminal_buffer_free(buffer: *mut TlTerminalBuffer) 
         if value.data.is_null() {
             return STATUS_INVALID_ARGUMENT;
         }
-        let len = match checked_length(value.len, MAX_HOST_EFFECT_FRAME_V2_BYTES) {
+        let len = match checked_length(
+            value.len,
+            MAX_GRAPHICS_SNAPSHOT_BYTES.max(MAX_HOST_EFFECT_FRAME_V2_BYTES),
+        ) {
             Ok(len) => len,
             Err(status) => return status,
         };
@@ -1531,41 +2146,54 @@ pub unsafe extern "C" fn tl_terminal_encode_input_v1(
     input: *const TlTerminalInputV1,
     out_encoded: *mut TlTerminalBuffer,
 ) -> u32 {
-    catch_status(|| {
-        if terminal.is_null() || input.is_null() || out_encoded.is_null() {
-            return STATUS_NULL_POINTER;
-        }
-        // SAFETY: The C contract requires a readable versioned input event.
-        let input = match unsafe { read_versioned(input) } {
-            Ok(input) => input,
-            Err(status) => return status,
-        };
-        if input.reserved != [0; 2] || input.modifiers & !INPUT_MODIFIERS_ALL != 0 {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: Validate the output without overwriting it.
-        let capacity = match unsafe { empty_buffer_capacity(out_encoded) } {
-            Ok(capacity) => capacity,
-            Err(status) => return status,
-        };
-        let event = match decode_input_event(&input) {
-            Ok(event) => event,
-            Err(status) => return status,
-        };
-        // SAFETY: The C contract excludes concurrent terminal access.
-        let terminal = unsafe { &*terminal };
-        let encoded = match terminal.inner.encode_input(event) {
-            Ok(encoded) => encoded,
-            Err(error) => return status_for_input_error(&error),
-        };
-        let buffer = match owned_buffer(encoded, capacity) {
-            Ok(buffer) => buffer,
-            Err(status) => return status,
-        };
-        // SAFETY: The capacity check established writable known fields.
-        unsafe { ptr::write_unaligned(out_encoded, buffer) };
-        STATUS_OK
+    catch_status(|| unsafe { encode_input_v1_impl(terminal, input, out_encoded, None) })
+}
+
+/// Additive same-call input encoding diagnostic. See the C header for ownership.
+///
+/// # Safety
+///
+/// The V1 input contract applies. Both output buffers must be independent,
+/// writable, versioned, and empty when provided.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_encode_input_v1_with_diagnostic(
+    terminal: *const TlTerminal,
+    input: *const TlTerminalInputV1,
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| unsafe {
+        encode_input_v1_impl(terminal, input, out_encoded, Some(out_diagnostic))
     })
+}
+
+unsafe fn encode_input_v1_impl(
+    terminal: *const TlTerminal,
+    input: *const TlTerminalInputV1,
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: Option<*mut TlTerminalBuffer>,
+) -> u32 {
+    if terminal.is_null() || input.is_null() || out_encoded.is_null() {
+        return STATUS_NULL_POINTER;
+    }
+    // SAFETY: The C contract requires a readable versioned input event.
+    let input = match unsafe { read_versioned(input) } {
+        Ok(input) => input,
+        Err(status) => return status,
+    };
+    if input.reserved != [0; 2] || input.modifiers & !INPUT_MODIFIERS_ALL != 0 {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: Validate the output without overwriting it.
+    let capacities = match unsafe { input_output_capacities(out_encoded, out_diagnostic) } {
+        Ok(capacities) => capacities,
+        Err(status) => return status,
+    };
+    let event = match decode_input_event(&input) {
+        Ok(event) => event,
+        Err(status) => return status,
+    };
+    unsafe { encode_decoded_input(terminal, event, out_encoded, out_diagnostic, capacities) }
 }
 
 /// Encodes one additive V2 semantic or Win32 key input event.
@@ -1581,44 +2209,54 @@ pub unsafe extern "C" fn tl_terminal_encode_input_v2(
     input: *const TlTerminalInputV2,
     out_encoded: *mut TlTerminalBuffer,
 ) -> u32 {
-    catch_status(|| {
-        if terminal.is_null() || input.is_null() || out_encoded.is_null() {
-            return STATUS_NULL_POINTER;
-        }
-        // SAFETY: The C contract requires a readable versioned V2 input event.
-        let input = match unsafe { read_versioned(input) } {
-            Ok(input) => input,
-            Err(status) => return status,
-        };
-        if input.reserved_v1_compat != [0; 2]
-            || input.reserved != [0; 2]
-            || input.modifiers & !INPUT_MODIFIERS_ALL != 0
-        {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: Validate the output without overwriting it.
-        let capacity = match unsafe { empty_buffer_capacity(out_encoded) } {
-            Ok(capacity) => capacity,
-            Err(status) => return status,
-        };
-        let event = match decode_input_event_v2(&input) {
-            Ok(event) => event,
-            Err(status) => return status,
-        };
-        // SAFETY: The C contract excludes concurrent terminal access.
-        let terminal = unsafe { &*terminal };
-        let encoded = match terminal.inner.encode_input(event) {
-            Ok(encoded) => encoded,
-            Err(error) => return status_for_input_error(&error),
-        };
-        let buffer = match owned_buffer(encoded, capacity) {
-            Ok(buffer) => buffer,
-            Err(status) => return status,
-        };
-        // SAFETY: The capacity check established writable known fields.
-        unsafe { ptr::write_unaligned(out_encoded, buffer) };
-        STATUS_OK
+    catch_status(|| unsafe { encode_input_v2_impl(terminal, input, out_encoded, None) })
+}
+
+/// # Safety
+///
+/// The V2 input contract applies. Both outputs must be independent and empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_encode_input_v2_with_diagnostic(
+    terminal: *const TlTerminal,
+    input: *const TlTerminalInputV2,
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| unsafe {
+        encode_input_v2_impl(terminal, input, out_encoded, Some(out_diagnostic))
     })
+}
+
+unsafe fn encode_input_v2_impl(
+    terminal: *const TlTerminal,
+    input: *const TlTerminalInputV2,
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: Option<*mut TlTerminalBuffer>,
+) -> u32 {
+    if terminal.is_null() || input.is_null() || out_encoded.is_null() {
+        return STATUS_NULL_POINTER;
+    }
+    // SAFETY: The C contract requires a readable versioned V2 input event.
+    let input = match unsafe { read_versioned(input) } {
+        Ok(input) => input,
+        Err(status) => return status,
+    };
+    if input.reserved_v1_compat != [0; 2]
+        || input.reserved != [0; 2]
+        || input.modifiers & !INPUT_MODIFIERS_ALL != 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: Validate the output without overwriting it.
+    let capacities = match unsafe { input_output_capacities(out_encoded, out_diagnostic) } {
+        Ok(capacities) => capacities,
+        Err(status) => return status,
+    };
+    let event = match decode_input_event_v2(&input) {
+        Ok(event) => event,
+        Err(status) => return status,
+    };
+    unsafe { encode_decoded_input(terminal, event, out_encoded, out_diagnostic, capacities) }
 }
 
 /// Encodes one additive V3 semantic, Win32, or Kitty key input event.
@@ -1634,38 +2272,48 @@ pub unsafe extern "C" fn tl_terminal_encode_input_v3(
     input: *const TlTerminalInputV3,
     out_encoded: *mut TlTerminalBuffer,
 ) -> u32 {
-    catch_status(|| {
-        if terminal.is_null() || input.is_null() || out_encoded.is_null() {
-            return STATUS_NULL_POINTER;
-        }
-        // SAFETY: The C contract requires a readable versioned V3 input event.
-        let input = match unsafe { read_versioned(input) } {
-            Ok(input) => input,
-            Err(status) => return status,
-        };
-        // SAFETY: Validate the output without overwriting it.
-        let capacity = match unsafe { empty_buffer_capacity(out_encoded) } {
-            Ok(capacity) => capacity,
-            Err(status) => return status,
-        };
-        let event = match decode_input_event_v3(&input) {
-            Ok(event) => event,
-            Err(status) => return status,
-        };
-        // SAFETY: The C contract excludes concurrent terminal access.
-        let terminal = unsafe { &*terminal };
-        let encoded = match terminal.inner.encode_input(event) {
-            Ok(encoded) => encoded,
-            Err(error) => return status_for_input_error(&error),
-        };
-        let buffer = match owned_buffer(encoded, capacity) {
-            Ok(buffer) => buffer,
-            Err(status) => return status,
-        };
-        // SAFETY: The capacity check established writable known fields.
-        unsafe { ptr::write_unaligned(out_encoded, buffer) };
-        STATUS_OK
+    catch_status(|| unsafe { encode_input_v3_impl(terminal, input, out_encoded, None) })
+}
+
+/// # Safety
+///
+/// The V3 input contract applies. Both outputs must be independent and empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_encode_input_v3_with_diagnostic(
+    terminal: *const TlTerminal,
+    input: *const TlTerminalInputV3,
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| unsafe {
+        encode_input_v3_impl(terminal, input, out_encoded, Some(out_diagnostic))
     })
+}
+
+unsafe fn encode_input_v3_impl(
+    terminal: *const TlTerminal,
+    input: *const TlTerminalInputV3,
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: Option<*mut TlTerminalBuffer>,
+) -> u32 {
+    if terminal.is_null() || input.is_null() || out_encoded.is_null() {
+        return STATUS_NULL_POINTER;
+    }
+    // SAFETY: The C contract requires a readable versioned V3 input event.
+    let input = match unsafe { read_versioned(input) } {
+        Ok(input) => input,
+        Err(status) => return status,
+    };
+    // SAFETY: Validate the output without overwriting it.
+    let capacities = match unsafe { input_output_capacities(out_encoded, out_diagnostic) } {
+        Ok(capacities) => capacities,
+        Err(status) => return status,
+    };
+    let event = match decode_input_event_v3(&input) {
+        Ok(event) => event,
+        Err(status) => return status,
+    };
+    unsafe { encode_decoded_input(terminal, event, out_encoded, out_diagnostic, capacities) }
 }
 
 /// Encodes one versioned semantic mouse event using current terminal modes.
@@ -1682,38 +2330,56 @@ pub unsafe extern "C" fn tl_terminal_encode_mouse_input_v1(
     input: *const TlTerminalMouseInputV1,
     out_encoded: *mut TlTerminalBuffer,
 ) -> u32 {
-    catch_status(|| {
-        if terminal.is_null() || input.is_null() || out_encoded.is_null() {
-            return STATUS_NULL_POINTER;
-        }
-        // SAFETY: The C contract requires a readable versioned mouse event.
-        let input = match unsafe { read_versioned(input) } {
-            Ok(input) => input,
-            Err(status) => return status,
-        };
-        let event = match decode_mouse_input_event(&input) {
-            Ok(event) => event,
-            Err(status) => return status,
-        };
-        // SAFETY: Validate the output without overwriting it.
-        let capacity = match unsafe { empty_buffer_capacity(out_encoded) } {
-            Ok(capacity) => capacity,
-            Err(status) => return status,
-        };
-        // SAFETY: The C contract excludes concurrent terminal access.
-        let terminal = unsafe { &*terminal };
-        let encoded = match terminal.inner.encode_input(InputEvent::Mouse(event)) {
-            Ok(encoded) => encoded,
-            Err(error) => return status_for_input_error(&error),
-        };
-        let buffer = match owned_buffer(encoded, capacity) {
-            Ok(buffer) => buffer,
-            Err(status) => return status,
-        };
-        // SAFETY: The capacity check established writable known fields.
-        unsafe { ptr::write_unaligned(out_encoded, buffer) };
-        STATUS_OK
+    catch_status(|| unsafe { encode_mouse_input_v1_impl(terminal, input, out_encoded, None) })
+}
+
+/// # Safety
+///
+/// The mouse input contract applies. Both outputs must be independent and empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_terminal_encode_mouse_input_v1_with_diagnostic(
+    terminal: *const TlTerminal,
+    input: *const TlTerminalMouseInputV1,
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: *mut TlTerminalBuffer,
+) -> u32 {
+    catch_status(|| unsafe {
+        encode_mouse_input_v1_impl(terminal, input, out_encoded, Some(out_diagnostic))
     })
+}
+
+unsafe fn encode_mouse_input_v1_impl(
+    terminal: *const TlTerminal,
+    input: *const TlTerminalMouseInputV1,
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: Option<*mut TlTerminalBuffer>,
+) -> u32 {
+    if terminal.is_null() || input.is_null() || out_encoded.is_null() {
+        return STATUS_NULL_POINTER;
+    }
+    // SAFETY: The C contract requires a readable versioned mouse event.
+    let input = match unsafe { read_versioned(input) } {
+        Ok(input) => input,
+        Err(status) => return status,
+    };
+    let event = match decode_mouse_input_event(&input) {
+        Ok(event) => event,
+        Err(status) => return status,
+    };
+    // SAFETY: Validate the output without overwriting it.
+    let capacities = match unsafe { input_output_capacities(out_encoded, out_diagnostic) } {
+        Ok(capacities) => capacities,
+        Err(status) => return status,
+    };
+    unsafe {
+        encode_decoded_input(
+            terminal,
+            InputEvent::Mouse(event),
+            out_encoded,
+            out_diagnostic,
+            capacities,
+        )
+    }
 }
 
 /// Reserved input encoding entry point. It currently returns unsupported.
@@ -1753,6 +2419,38 @@ fn decode_terminal_event<'a>(event: &TlTerminalEvent) -> Result<Event<'a>, u32> 
         return Err(STATUS_INVALID_ARGUMENT);
     }
     match event.kind {
+        EVENT_HOST_THEME_V1 => {
+            if event.columns != 0 || event.rows != 0 || event.advance_micros != 0 {
+                return Err(STATUS_INVALID_ARGUMENT);
+            }
+            let bytes = borrowed_bytes(
+                event.data,
+                event.data_len,
+                termlink_terminal_core::HOST_THEME_V1_BYTES,
+            )?;
+            termlink_terminal_core::HostThemeV1::decode(bytes)
+                .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+            Ok(Event::HostTheme {
+                source_sequence: event.source_sequence,
+                bytes,
+            })
+        }
+        EVENT_HOST_GEOMETRY_V1 => {
+            if event.columns != 0 || event.rows != 0 || event.advance_micros != 0 {
+                return Err(STATUS_INVALID_ARGUMENT);
+            }
+            let bytes = borrowed_bytes(
+                event.data,
+                event.data_len,
+                termlink_terminal_core::HOST_GEOMETRY_V1_BYTES,
+            )?;
+            let geometry = termlink_terminal_core::HostGeometryV1::decode(bytes)
+                .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+            Ok(Event::HostGeometry {
+                source_sequence: event.source_sequence,
+                geometry,
+            })
+        }
         EVENT_OUTPUT => {
             if event.columns != 0 || event.rows != 0 || event.advance_micros != 0 {
                 return Err(STATUS_INVALID_ARGUMENT);
@@ -2748,11 +3446,17 @@ fn status_for_result(result: Result<(), TerminalError>) -> u32 {
 fn status_for_error(error: &TerminalError) -> u32 {
     match error {
         TerminalError::InvalidDimensions => STATUS_INVALID_DIMENSIONS,
-        TerminalError::LimitExceeded | TerminalError::SequenceExhausted => STATUS_LIMIT_EXCEEDED,
+        TerminalError::LimitExceeded
+        | TerminalError::ProtocolResourceLimit(_)
+        | TerminalError::SequenceExhausted => STATUS_LIMIT_EXCEEDED,
         TerminalError::SequenceMismatch { .. } => STATUS_SEQUENCE_MISMATCH,
         TerminalError::FailedClosed => STATUS_FAILED_CLOSED,
         TerminalError::HostEffectVersionRequired => STATUS_HOST_EFFECT_VERSION_REQUIRED,
-        TerminalError::Unsupported(_) => STATUS_UNSUPPORTED,
+        TerminalError::RenderFrameVersionRequired => STATUS_RENDER_FRAME_VERSION_REQUIRED,
+        TerminalError::Unsupported(_)
+        | TerminalError::UnsupportedPayload { .. }
+        | TerminalError::UnsupportedDecodedPayload { .. }
+        | TerminalError::BrokerCaptureRequired => STATUS_UNSUPPORTED,
         TerminalError::Gap => STATUS_GAP,
         TerminalError::SnapshotNotEligible => STATUS_SNAPSHOT_NOT_ELIGIBLE,
         TerminalError::PresentationDeferred => STATUS_PRESENTATION_DEFERRED,
@@ -2776,7 +3480,8 @@ fn status_for_input_error(error: &InputEncodeError) -> u32 {
         InputEncodeError::InvalidMouseButtonState { .. }
         | InputEncodeError::MissingMousePixelPosition
         | InputEncodeError::MouseCellOutOfBounds { .. } => STATUS_INVALID_ARGUMENT,
-        InputEncodeError::UnsupportedModifiers { .. }
+        InputEncodeError::UnsupportedVt52Key(_)
+        | InputEncodeError::UnsupportedModifiers { .. }
         | InputEncodeError::UnsupportedControlCharacter(_)
         | InputEncodeError::Win32InputModeDisabled
         | InputEncodeError::KittyKeyEventRequired
@@ -2784,9 +3489,787 @@ fn status_for_input_error(error: &InputEncodeError) -> u32 {
     }
 }
 
+unsafe fn input_output_capacities(
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: Option<*mut TlTerminalBuffer>,
+) -> Result<(u32, Option<u32>), u32> {
+    if let Some(diagnostic) = out_diagnostic {
+        if diagnostic.is_null() {
+            return Err(STATUS_NULL_POINTER);
+        }
+        // Both public structs are 24 bytes on the supported ABI. Reject even
+        // partially overlapping known fields before inspecting either buffer.
+        if (out_encoded as usize).abs_diff(diagnostic as usize) < mem::size_of::<TlTerminalBuffer>()
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+    }
+    // SAFETY: Callers promise readable versioned buffer prefixes and known fields.
+    let encoded_capacity = unsafe { empty_buffer_capacity(out_encoded) }?;
+    let diagnostic_capacity = match out_diagnostic {
+        Some(diagnostic) => Some(unsafe { empty_buffer_capacity(diagnostic) }?),
+        None => None,
+    };
+    Ok((encoded_capacity, diagnostic_capacity))
+}
+
+unsafe fn encode_decoded_input(
+    terminal: *const TlTerminal,
+    event: InputEvent<'_>,
+    out_encoded: *mut TlTerminalBuffer,
+    out_diagnostic: Option<*mut TlTerminalBuffer>,
+    capacities: (u32, Option<u32>),
+) -> u32 {
+    // SAFETY: The C contract excludes concurrent terminal access.
+    let terminal = unsafe { &*terminal };
+    match terminal.inner.encode_input(event) {
+        Ok(encoded) => {
+            let buffer = match owned_buffer(encoded, capacities.0) {
+                Ok(buffer) => buffer,
+                Err(status) => return status,
+            };
+            // SAFETY: Output preflight established writable known fields.
+            unsafe { ptr::write_unaligned(out_encoded, buffer) };
+            STATUS_OK
+        }
+        Err(error) => {
+            let status = status_for_input_error(&error);
+            if let (Some(diagnostic), Some(capacity)) = (out_diagnostic, capacities.1) {
+                let bytes = input_diagnostic::format_input_diagnostic(&error, event);
+                let buffer = match owned_buffer_with_limit(
+                    bytes,
+                    capacity,
+                    input_diagnostic::MAX_INPUT_DIAGNOSTIC_BYTES,
+                ) {
+                    Ok(buffer) => buffer,
+                    Err(buffer_status) => return buffer_status,
+                };
+                // SAFETY: Output preflight established writable known fields.
+                unsafe { ptr::write_unaligned(diagnostic, buffer) };
+            }
+            status
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn graphics_config() -> TlTerminalConfigV4 {
+        TlTerminalConfigV4 {
+            abi_version: ABI_VERSION,
+            struct_size: 112,
+            columns: 10,
+            rows: 3,
+            initial_source_sequence: 0,
+            reserved_v1_compat: [0; 2],
+            history_capacity_rows: 20,
+            reserved_v2_compat: [0; 2],
+            output_profile: OUTPUT_PROFILE_UTF8,
+            reserved0: 0,
+            reserved_v3_compat: [0; 2],
+            width_profile: 2,
+            reserved1: 0,
+            reserved: [0; 2],
+        }
+    }
+
+    unsafe fn apply_graphics_test_geometry(terminal: *mut TlTerminal) {
+        let bytes = termlink_terminal_core::HostGeometryV1 {
+            cell_width: 10,
+            cell_height: 20,
+            ..Default::default()
+        }
+        .encode();
+        let mut event = output(0, &bytes);
+        event.kind = EVENT_HOST_GEOMETRY_V1;
+        // SAFETY: The caller owns this live terminal, and the event borrows local bytes.
+        assert_eq!(
+            unsafe { tl_terminal_apply_event(terminal, &event) },
+            STATUS_OK
+        );
+    }
+
+    #[test]
+    fn graphics_abi_roundtrips_explicit_snapshots_and_render_v5() {
+        use termlink_terminal_core::render_frame_v5::Frame;
+        assert_eq!(tl_terminal_max_snapshot_bytes(), 64 * 1024 * 1024);
+        assert_eq!(tl_terminal_max_graphics_snapshot_bytes(), 128 * 1024 * 1024);
+        assert_eq!(tl_terminal_render_frame_v5_format_version(), 5);
+        assert_eq!(tl_terminal_render_frame_v5_max_bytes(), 64 * 1024 * 1024);
+        // SAFETY: Owned live handles, readable inputs and writable outputs are released below.
+        unsafe {
+            let mut terminal = ptr::null_mut();
+            assert_eq!(
+                tl_terminal_create_graphics_v1(&graphics_config(), &mut terminal),
+                STATUS_OK
+            );
+            apply_graphics_test_geometry(terminal);
+            assert_eq!(
+                tl_terminal_apply_event(
+                    terminal,
+                    &output(1, b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1,q=2;AQIDBA==\x1b\\")
+                ),
+                STATUS_OK
+            );
+            let frozen = checkpoint(terminal);
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v5(frozen, 1, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert!(buffer.data.is_null());
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v4(
+                    frozen,
+                    MAX_RENDER_FRAME_V4_BYTES as u64,
+                    &mut buffer
+                ),
+                STATUS_RENDER_FRAME_VERSION_REQUIRED
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_snapshot(frozen, &mut buffer),
+                STATUS_INCOMPATIBLE_SNAPSHOT
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v5(frozen, 0, &mut buffer),
+                STATUS_OK
+            );
+            let frame = copy_and_free(buffer);
+            assert_eq!(Frame::decode(&frame).unwrap().images.len(), 1);
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v5_at_scrollback(
+                    frozen,
+                    u32::MAX,
+                    0,
+                    &mut buffer
+                ),
+                STATUS_OK
+            );
+            assert_eq!(copy_and_free(buffer), frame);
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_snapshot_graphics_v1(frozen, &mut buffer),
+                STATUS_OK
+            );
+            let bytes = copy_and_free(buffer);
+            assert_eq!(&bytes[8..12], &[2, 0, 22, 0]);
+            let mut restored = ptr::null_mut();
+            assert_eq!(
+                tl_terminal_import_snapshot(bytes.as_ptr(), bytes.len() as u64, &mut restored),
+                STATUS_INCOMPATIBLE_SNAPSHOT
+            );
+            assert!(restored.is_null());
+            assert_eq!(
+                tl_terminal_import_snapshot_graphics_v1(
+                    bytes.as_ptr(),
+                    bytes.len() as u64,
+                    &mut restored
+                ),
+                STATUS_OK
+            );
+            let restored_frozen = checkpoint(restored);
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v5(restored_frozen, 0, &mut buffer),
+                STATUS_OK
+            );
+            assert_eq!(copy_and_free(buffer), frame);
+            tl_terminal_checkpoint_destroy(restored_frozen);
+            tl_terminal_destroy(restored);
+            tl_terminal_checkpoint_destroy(frozen);
+            tl_terminal_destroy(terminal);
+
+            let mut text = ptr::null_mut();
+            assert_eq!(
+                tl_terminal_create_v4(&graphics_config(), &mut text),
+                STATUS_OK
+            );
+            let frozen = checkpoint(text);
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_snapshot_graphics_v1(frozen, &mut buffer),
+                STATUS_INCOMPATIBLE_SNAPSHOT
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_snapshot(frozen, &mut buffer),
+                STATUS_OK
+            );
+            let bytes = copy_and_free(buffer);
+            let mut rejected = ptr::null_mut();
+            assert_eq!(
+                tl_terminal_import_snapshot_graphics_v1(
+                    bytes.as_ptr(),
+                    bytes.len() as u64,
+                    &mut rejected
+                ),
+                STATUS_INCOMPATIBLE_SNAPSHOT
+            );
+            assert!(rejected.is_null());
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v5(frozen, 0, &mut buffer),
+                STATUS_OK
+            );
+            assert!(
+                Frame::decode(&copy_and_free(buffer))
+                    .unwrap()
+                    .images
+                    .is_empty()
+            );
+            tl_terminal_checkpoint_destroy(frozen);
+            tl_terminal_destroy(text);
+        }
+    }
+
+    #[test]
+    fn graphics_abi_rejects_bad_inputs_without_publishing_and_frees_large_buffers() {
+        // SAFETY: Invalid lengths/nulls are rejected before dereference. Other inputs are local storage.
+        unsafe {
+            let mut terminal = ptr::null_mut();
+            assert_eq!(
+                tl_terminal_create_graphics_v1(ptr::null(), &mut terminal),
+                STATUS_NULL_POINTER
+            );
+            for bad in [
+                TlTerminalConfigV4 {
+                    abi_version: 2,
+                    ..graphics_config()
+                },
+                TlTerminalConfigV4 {
+                    struct_size: 120,
+                    ..graphics_config()
+                },
+                TlTerminalConfigV4 {
+                    reserved: [0, 1],
+                    ..graphics_config()
+                },
+                TlTerminalConfigV4 {
+                    reserved_v1_compat: [1, 0],
+                    ..graphics_config()
+                },
+                TlTerminalConfigV4 {
+                    reserved_v2_compat: [1, 0],
+                    ..graphics_config()
+                },
+                TlTerminalConfigV4 {
+                    reserved_v3_compat: [1, 0],
+                    ..graphics_config()
+                },
+                TlTerminalConfigV4 {
+                    reserved0: 1,
+                    ..graphics_config()
+                },
+                TlTerminalConfigV4 {
+                    reserved1: 1,
+                    ..graphics_config()
+                },
+                TlTerminalConfigV4 {
+                    output_profile: u32::MAX,
+                    ..graphics_config()
+                },
+                TlTerminalConfigV4 {
+                    width_profile: u32::MAX,
+                    ..graphics_config()
+                },
+            ] {
+                assert_eq!(
+                    tl_terminal_create_graphics_v1(&bad, &mut terminal),
+                    STATUS_INVALID_ARGUMENT
+                );
+                assert!(terminal.is_null());
+            }
+            assert_eq!(
+                tl_terminal_import_snapshot_graphics_v1(ptr::null(), 1, &mut terminal),
+                STATUS_NULL_POINTER
+            );
+            assert_eq!(
+                tl_terminal_import_snapshot_graphics_v1(ptr::dangling(), u64::MAX, &mut terminal),
+                STATUS_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                tl_terminal_import_snapshot_graphics_v1(
+                    ptr::dangling(),
+                    MAX_GRAPHICS_SNAPSHOT_BYTES as u64 + 1,
+                    &mut terminal
+                ),
+                STATUS_LIMIT_EXCEEDED
+            );
+            assert!(terminal.is_null());
+            let short = [0u8; 11];
+            assert_eq!(
+                tl_terminal_import_snapshot_graphics_v1(
+                    short.as_ptr(),
+                    short.len() as u64,
+                    &mut terminal
+                ),
+                STATUS_MALFORMED_SNAPSHOT
+            );
+            assert_eq!(
+                tl_terminal_create_graphics_v1(&graphics_config(), &mut terminal),
+                STATUS_OK
+            );
+            let original = terminal;
+            assert_eq!(
+                tl_terminal_create_graphics_v1(&graphics_config(), &mut terminal),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(terminal, original);
+            assert_eq!(
+                tl_terminal_import_snapshot_graphics_v1(ptr::null(), 0, &mut terminal),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(terminal, original);
+            let frozen = checkpoint(terminal);
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_snapshot_graphics_v1(frozen, &mut buffer),
+                STATUS_OK
+            );
+            let mut bytes = copy_and_free(buffer);
+            bytes[10..12].copy_from_slice(&23u16.to_le_bytes());
+            let mut rejected = ptr::null_mut();
+            assert_eq!(
+                tl_terminal_import_snapshot_graphics_v1(
+                    bytes.as_ptr(),
+                    bytes.len() as u64,
+                    &mut rejected
+                ),
+                STATUS_INCOMPATIBLE_SNAPSHOT
+            );
+            assert!(rejected.is_null());
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v5(ptr::null(), 0, &mut buffer),
+                STATUS_NULL_POINTER
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v5(frozen, u32::MAX, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert!(buffer.data.is_null());
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v5(frozen, 0, &mut buffer),
+                STATUS_OK
+            );
+            let owned = (buffer.data, buffer.len);
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v5(frozen, 0, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!((buffer.data, buffer.len), owned);
+            assert_eq!(tl_terminal_buffer_free(&mut buffer), STATUS_OK);
+            tl_terminal_checkpoint_destroy(frozen);
+            tl_terminal_destroy(terminal);
+
+            let mut large = owned_buffer_with_limit(
+                vec![0; MAX_GRAPHICS_SNAPSHOT_BYTES],
+                tl_terminal_buffer_struct_size(),
+                MAX_GRAPHICS_SNAPSHOT_BYTES,
+            )
+            .unwrap();
+            let length = large.len;
+            large.len -= 1;
+            assert_eq!(tl_terminal_buffer_free(&mut large), STATUS_INVALID_ARGUMENT);
+            large.len = length;
+            assert_eq!(tl_terminal_buffer_free(&mut large), STATUS_OK);
+            assert!(large.data.is_null());
+            assert_eq!(large.len, 0);
+        }
+    }
+
+    #[test]
+    fn graphics_history_v2_keeps_frozen_pixels_and_legacy_gates() {
+        use termlink_terminal_core::{HISTORY_LATEST_ANCHOR, HistoryPage, render_frame_v5::Frame};
+        // SAFETY: The test owns each handle and capture; every successful buffer is freed.
+        unsafe {
+            let mut terminal = ptr::null_mut();
+            assert_eq!(
+                tl_terminal_create_graphics_v1(&graphics_config(), &mut terminal),
+                STATUS_OK
+            );
+            apply_graphics_test_geometry(terminal);
+            assert_eq!(tl_terminal_apply_event(terminal, &output(1,
+                b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1,q=2;AQIDBA==\x1b\\one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n")), STATUS_OK);
+            let mut capture = TlTerminalHistoryCaptureV1 {
+                abi_version: ABI_VERSION,
+                struct_size: 48,
+                ..Default::default()
+            };
+            assert_eq!(
+                tl_terminal_history_begin_v1(terminal, &mut capture),
+                STATUS_OK
+            );
+            let mut request = TlTerminalHistoryRequestV1 {
+                abi_version: ABI_VERSION,
+                struct_size: 64,
+                capture_id: capture.capture_id,
+                owner_id: capture.owner_id,
+                revision: capture.revision,
+                before_line_id: HISTORY_LATEST_ANCHOR,
+                max_lines: 128,
+                max_cells: 65536,
+                max_utf8_bytes: 4 * 1024 * 1024,
+                ..Default::default()
+            };
+            let mut buffer = empty_buffer();
+            let (mut cells, mut utf8, mut rows, mut generation) = (0, 0, 99, 99);
+            assert_eq!(
+                tl_terminal_history_page_v1(&request, &mut buffer, &mut cells, &mut utf8),
+                STATUS_RENDER_FRAME_VERSION_REQUIRED
+            );
+            assert_eq!(
+                tl_terminal_history_viewport_v1(
+                    capture.capture_id,
+                    capture.owner_id,
+                    capture.revision,
+                    u32::MAX,
+                    &mut buffer,
+                    &mut rows,
+                    &mut generation
+                ),
+                STATUS_RENDER_FRAME_VERSION_REQUIRED
+            );
+            assert_eq!((rows, generation), (99, 99));
+            assert!(buffer.data.is_null());
+            request.reserved = 1;
+            assert_eq!(
+                tl_terminal_history_page_v2(&request, &mut buffer, &mut cells, &mut utf8),
+                STATUS_INVALID_ARGUMENT
+            );
+            request.reserved = 0;
+            assert_eq!(
+                tl_terminal_history_page_v2(&request, &mut buffer, &mut cells, &mut utf8),
+                STATUS_OK
+            );
+            let frozen_page = copy_and_free(buffer);
+            let page = HistoryPage::decode_v2(&frozen_page, capture.capture_id).unwrap();
+            assert!(
+                page.frames
+                    .iter()
+                    .any(|frame| !Frame::decode(frame).unwrap().images.is_empty())
+            );
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_history_viewport_v2(
+                    capture.capture_id,
+                    capture.owner_id,
+                    capture.revision,
+                    u32::MAX,
+                    &mut buffer,
+                    &mut rows,
+                    &mut generation
+                ),
+                STATUS_OK
+            );
+            let frozen_view = copy_and_free(buffer);
+            assert_eq!(Frame::decode(&frozen_view).unwrap().images.len(), 1);
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &output(2, b"\x1bc")),
+                STATUS_OK
+            );
+            tl_terminal_destroy(terminal);
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_history_page_v2(&request, &mut buffer, &mut cells, &mut utf8),
+                STATUS_OK
+            );
+            assert_eq!(copy_and_free(buffer), frozen_page);
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_history_viewport_v2(
+                    capture.capture_id,
+                    capture.owner_id,
+                    capture.revision,
+                    u32::MAX,
+                    &mut buffer,
+                    &mut rows,
+                    &mut generation
+                ),
+                STATUS_OK
+            );
+            assert_eq!(copy_and_free(buffer), frozen_view);
+            buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_history_viewport_v2(
+                    capture.capture_id,
+                    capture.owner_id,
+                    capture.revision + 1,
+                    0,
+                    &mut buffer,
+                    &mut rows,
+                    &mut generation
+                ),
+                STATUS_HISTORY_STALE_REVISION
+            );
+            assert_eq!(
+                tl_terminal_history_release_v1(capture.capture_id, capture.owner_id),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_history_page_v2(&request, &mut buffer, &mut cells, &mut utf8),
+                STATUS_HISTORY_STALE_CAPTURE
+            );
+            assert!(buffer.data.is_null());
+        }
+    }
+
+    #[test]
+    fn legacy_abi_cannot_attach_unrenderable_graphics_profile() {
+        let terminal = Terminal::new_with_graphics_profile(
+            20,
+            4,
+            0,
+            TerminalOptions::default(),
+            OutputProfile::Utf8,
+            termlink_terminal_core::WidthProfile::Unicode16,
+        )
+        .unwrap();
+        let bytes = terminal.export_snapshot_v2().unwrap();
+        let mut handle = ptr::null_mut();
+        assert_eq!(
+            unsafe { tl_terminal_import_snapshot(bytes.as_ptr(), bytes.len() as u64, &mut handle) },
+            STATUS_INCOMPATIBLE_SNAPSHOT
+        );
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn diagnostic_v3_owns_expanded_evidence_and_keeps_v2_frozen() {
+        let mut terminal = ptr::null_mut();
+        // SAFETY: All handles and buffers are live, locally owned and freed below.
+        unsafe {
+            assert_eq!(
+                tl_terminal_create(&config(20, 6, 0), &mut terminal),
+                STATUS_OK
+            );
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v3(ptr::null(), &mut buffer),
+                STATUS_NULL_POINTER
+            );
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v3(terminal, &mut buffer),
+                STATUS_OK
+            );
+            assert!(buffer.data.is_null());
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &output(0, b"\x1bP5;0;1!z1B5B3939396D\x1b\\")),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &output(1, b"\x1b[5*z")),
+                STATUS_UNSUPPORTED
+            );
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v3(terminal, &mut buffer),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v3(terminal, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            let bytes = copy_and_free(buffer);
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(
+                text.starts_with("TL-DIAG/3\n") && text.contains("expanded_sequence=<ESC>[999m\n")
+            );
+            assert!(text.len() <= 8192);
+            let mut legacy = empty_buffer();
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v2(terminal, &mut legacy),
+                STATUS_OK
+            );
+            let bytes = copy_and_free(legacy);
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(text.starts_with("TL-DIAG/2\n") && !text.contains("expanded_"));
+            tl_terminal_destroy(terminal);
+        }
+    }
+
+    #[test]
+    fn host_theme_ffi_validation_and_ordered_replies() {
+        let mut bytes = [0; termlink_terminal_core::HOST_THEME_V1_BYTES];
+        bytes[0] = 1;
+        bytes[4] = 1;
+        let mut event = output(1, &bytes);
+        event.kind = EVENT_HOST_THEME_V1;
+        let mut terminal = ptr::null_mut();
+        // SAFETY: All pointers refer to owned live buffers and locally created handles.
+        unsafe {
+            assert_eq!(
+                tl_terminal_create(&config(80, 24, 1), &mut terminal),
+                STATUS_OK
+            );
+            let mut invalid = event;
+            invalid.data_len -= 1;
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &invalid),
+                STATUS_INVALID_ARGUMENT
+            );
+            invalid = event;
+            invalid.rows = 1;
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &invalid),
+                STATUS_INVALID_ARGUMENT
+            );
+            let mut bad = bytes;
+            bad[11] = 1;
+            invalid = event;
+            invalid.data = bad.as_ptr();
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &invalid),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(tl_terminal_apply_event(terminal, &event), STATUS_OK);
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_apply_event_with_host_effects_v2(
+                    terminal,
+                    &output(2, b"\x1b[?996n\x1b[?2031h"),
+                    &mut buffer
+                ),
+                STATUS_OK
+            );
+            assert_eq!(
+                host_effect_payloads(&copy_and_free(buffer)),
+                [b"\x1b[?997;1n".to_vec(), b"\x1b[?997;1n".to_vec()]
+            );
+            tl_terminal_destroy(terminal);
+        }
+    }
+
+    #[test]
+    fn host_geometry_event_validates_wire_payload_before_applying_or_publishing() {
+        let bytes = termlink_terminal_core::HostGeometryV1 {
+            cell_width: 9,
+            cell_height: 18,
+            display_width: 1920,
+            display_height: 1080,
+            window_width: 0,
+            window_height: 0,
+        }
+        .encode();
+        let mut event = output(1, &bytes);
+        event.kind = EVENT_HOST_GEOMETRY_V1;
+        let mut terminal = ptr::null_mut();
+        // SAFETY: All pointers refer to owned live buffers or locally created handles.
+        unsafe {
+            assert_eq!(
+                tl_terminal_create(&config(80, 24, 1), &mut terminal),
+                STATUS_OK
+            );
+            let mut invalid = event;
+            invalid.columns = 80;
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &invalid),
+                STATUS_INVALID_ARGUMENT
+            );
+            invalid = event;
+            invalid.data_len = 31;
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &invalid),
+                STATUS_INVALID_ARGUMENT
+            );
+            let mut bad = bytes;
+            bad[28] = 1;
+            invalid = event;
+            invalid.data = bad.as_ptr();
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &invalid),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(tl_terminal_apply_event(terminal, &event), STATUS_OK);
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_apply_event_with_host_effects_v2(
+                    terminal,
+                    &output(2, b"\x1b[14t\x1b[16t\x1b[19t"),
+                    &mut buffer
+                ),
+                STATUS_OK
+            );
+            let frame = copy_and_free(buffer);
+            assert_eq!(
+                host_effect_payloads(&frame),
+                [
+                    b"\x1b[4;432;720t".as_slice(),
+                    b"\x1b[6;18;9t",
+                    b"\x1b[9;60;213t"
+                ]
+            );
+            tl_terminal_destroy(terminal);
+        }
+    }
+
+    #[test]
+    fn diagnostic_export_survives_failure_and_validates_output_ownership() {
+        let mut terminal = ptr::null_mut();
+        let mut buffer = empty_buffer();
+        // SAFETY: All handles and output buffers are live and locally owned.
+        unsafe {
+            assert_eq!(
+                tl_terminal_create(&config(80, 24, 0), &mut terminal),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v1(terminal, &mut buffer),
+                STATUS_OK
+            );
+            assert!(buffer.data.is_null());
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v1(ptr::null(), &mut buffer),
+                STATUS_NULL_POINTER
+            );
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &output(0, b"x\x1b[?")),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &output(1, b"9999h")),
+                STATUS_UNSUPPORTED
+            );
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v1(terminal, &mut buffer),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v1(terminal, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            let bytes = copy_and_free(buffer);
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(text.contains("sequence=<ESC>[?9999h\n"));
+            assert!(text.contains("start=0:1\nend=1:5\n"));
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &output(1, b"retry")),
+                STATUS_FAILED_CLOSED
+            );
+            let mut retry = empty_buffer();
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v1(terminal, &mut retry),
+                STATUS_OK
+            );
+            assert_eq!(copy_and_free(retry), bytes);
+            let mut extended = empty_buffer();
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v2(terminal, &mut extended),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_export_failure_diagnostic_v2(terminal, &mut extended),
+                STATUS_INVALID_ARGUMENT
+            );
+            let extended = copy_and_free(extended);
+            let extended = std::str::from_utf8(&extended).unwrap();
+            assert!(extended.starts_with("TL-DIAG/2\n"));
+            assert!(extended.contains("detected_at=1:4\nlast_byte=68\nlast_codepoint=U+0068\n"));
+            assert!(extended.contains("core_impact=failed_closed\n"));
+            tl_terminal_destroy(terminal);
+        }
+    }
 
     fn config(columns: u32, rows: u32, initial_source_sequence: u64) -> TlTerminalConfigV1 {
         TlTerminalConfigV1 {
@@ -2796,6 +4279,211 @@ mod tests {
             rows,
             initial_source_sequence,
             reserved: [0; 2],
+        }
+    }
+
+    #[test]
+    fn shell_state_export_is_bounded_owned_and_frozen() {
+        // SAFETY: all handles/buffers stay owned for each call and are released once.
+        unsafe {
+            let terminal = create(&config(20, 3, 1)).unwrap();
+            assert_eq!(
+                tl_terminal_apply_event(
+                    terminal,
+                    &output(1, b"\x1b]7;file:///C:/work\x1b\\\x1b]133;A\x1b\\")
+                ),
+                STATUS_OK
+            );
+            let frozen = checkpoint(terminal);
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_shell_state_v1(ptr::null(), 273696, &mut buffer),
+                STATUS_NULL_POINTER
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_shell_state_v1(frozen, 0, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_shell_state_v1(frozen, 273697, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_shell_state_v1(frozen, 1, &mut buffer),
+                STATUS_LIMIT_EXCEEDED
+            );
+            assert!(buffer.data.is_null());
+            assert_eq!(
+                tl_terminal_checkpoint_export_shell_state_v1(frozen, 273696, &mut buffer),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_shell_state_v1(frozen, 273696, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            let bytes = copy_and_free(buffer);
+            let shell = termlink_terminal_core::ShellIntegration::decode(&bytes, 2).unwrap();
+            assert_eq!(shell.cwd_uri, "file:///C:/work");
+            assert_eq!(shell.commands.len(), 1);
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &output(2, b"\x1bc")),
+                STATUS_OK
+            );
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_shell_state_v1(frozen, 273696, &mut buffer),
+                STATUS_OK
+            );
+            assert_eq!(copy_and_free(buffer), bytes);
+            tl_terminal_checkpoint_destroy(frozen);
+            tl_terminal_destroy(terminal);
+        }
+    }
+
+    #[test]
+    fn committed_host_signals_have_exact_owned_buffer_and_null_boundaries() {
+        // SAFETY: this test owns each live handle/buffer until its single destruction.
+        unsafe {
+            let terminal = create(&config(20, 3, 1)).unwrap();
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_get_host_signals_v1(ptr::null(), &mut buffer),
+                STATUS_NULL_POINTER
+            );
+            assert_eq!(
+                tl_terminal_get_host_signals_v1(terminal, ptr::null_mut()),
+                STATUS_NULL_POINTER
+            );
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &output(1, b"\x1b]9;4;2;75\x1b\\")),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_get_host_signals_v1(terminal, &mut buffer),
+                STATUS_OK
+            );
+            assert_eq!(
+                tl_terminal_get_host_signals_v1(terminal, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            let state =
+                termlink_terminal_core::HostSignalsV1::decode(&copy_and_free(buffer)).unwrap();
+            assert_eq!((state.progress_state, state.progress_percent), (2, 75));
+            tl_terminal_destroy(terminal);
+        }
+    }
+
+    #[test]
+    fn live_shell_state_export_survives_partial_control_sequences() {
+        // A pending parser sequence must not make the committed Shell
+        // Integration state unavailable or cause speculative OSC 7/133 data to
+        // leak into the exported frame.
+        for partial in [
+            &b"\x1b["[..],
+            &b"\x1b]7;file:///C:/uncommitted"[..],
+            &b"\x1b]133;D;9"[..],
+            &b"\x1bP1;2;3"[..],
+        ] {
+            // SAFETY: Each iteration owns its terminal and buffers, and the
+            // event payloads remain borrowed only for the duration of calls.
+            unsafe {
+                let terminal = create(&config(20, 3, 1)).unwrap();
+                assert_eq!(
+                    tl_terminal_apply_event(
+                        terminal,
+                        &output(1, b"\x1b]7;file:///C:/work\x1b\\\x1b]133;A\x1b\\")
+                    ),
+                    STATUS_OK
+                );
+                let mut baseline_buffer = empty_buffer();
+                assert_eq!(
+                    tl_terminal_get_shell_state_v1(
+                        terminal,
+                        termlink_terminal_core::MAX_SHELL_STATE_BYTES as u64,
+                        &mut baseline_buffer,
+                    ),
+                    STATUS_OK
+                );
+                let baseline = copy_and_free(baseline_buffer);
+                let baseline_state =
+                    termlink_terminal_core::ShellIntegration::decode(&baseline, 2).unwrap();
+                assert_eq!(baseline_state.cwd_uri, "file:///C:/work");
+                assert_eq!(baseline_state.commands.len(), 1);
+
+                assert_eq!(
+                    tl_terminal_apply_event(terminal, &output(2, partial)),
+                    STATUS_OK
+                );
+                let mut live_buffer = empty_buffer();
+                assert_eq!(
+                    tl_terminal_get_shell_state_v1(
+                        terminal,
+                        termlink_terminal_core::MAX_SHELL_STATE_BYTES as u64,
+                        &mut live_buffer,
+                    ),
+                    STATUS_OK
+                );
+                let live = copy_and_free(live_buffer);
+                assert_eq!(live, baseline);
+
+                // Checkpoint export retains its strict presentation
+                // eligibility contract while the live API remains readable.
+                let mut checkpoint = ptr::null_mut();
+                assert_eq!(
+                    tl_terminal_checkpoint_begin(terminal, &mut checkpoint),
+                    STATUS_SNAPSHOT_NOT_ELIGIBLE
+                );
+                assert!(checkpoint.is_null());
+                tl_terminal_destroy(terminal);
+            }
+        }
+    }
+
+    #[test]
+    fn live_shell_state_export_is_bounded_owned_and_freeable() {
+        // SAFETY: all pointers and owned buffers are validated and released in
+        // the same scope as their corresponding calls.
+        unsafe {
+            let terminal = create(&config(20, 3, 1)).unwrap();
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_get_shell_state_v1(ptr::null(), 32, &mut buffer),
+                STATUS_NULL_POINTER
+            );
+            assert_eq!(
+                tl_terminal_get_shell_state_v1(terminal, 32, ptr::null_mut()),
+                STATUS_NULL_POINTER
+            );
+            assert_eq!(
+                tl_terminal_get_shell_state_v1(terminal, 0, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                tl_terminal_get_shell_state_v1(
+                    terminal,
+                    termlink_terminal_core::MAX_SHELL_STATE_BYTES as u64 + 1,
+                    &mut buffer,
+                ),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                tl_terminal_get_shell_state_v1(terminal, 31, &mut buffer),
+                STATUS_LIMIT_EXCEEDED
+            );
+            assert!(buffer.data.is_null());
+            assert_eq!(
+                tl_terminal_get_shell_state_v1(terminal, 32, &mut buffer),
+                STATUS_OK
+            );
+            assert_eq!(buffer.len, 32);
+            assert_eq!(
+                tl_terminal_get_shell_state_v1(terminal, 32, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(tl_terminal_buffer_free(&mut buffer), STATUS_OK);
+            assert!(buffer.data.is_null());
+            assert_eq!(buffer.len, 0);
+            tl_terminal_destroy(terminal);
         }
     }
 
@@ -2847,6 +4535,121 @@ mod tests {
             #[cfg(target_pointer_width = "32")]
             data_pointer_padding: 0,
             len: 0,
+        }
+    }
+
+    #[test]
+    fn config_v4_and_render_v4_preserve_frozen_profiles_and_old_contracts() {
+        assert_eq!(tl_terminal_config_v4_struct_size(), 112);
+        assert_eq!(tl_terminal_render_frame_v4_format_version(), 4);
+        assert_eq!(tl_terminal_render_frame_v4_max_bytes(), 32 * 1024 * 1024);
+        // SAFETY: Every pointer below refers to an owned live allocation or a
+        // stack value of its declared size; buffers are freed by this library.
+        unsafe {
+            let config = TlTerminalConfigV4 {
+                abi_version: ABI_VERSION,
+                struct_size: 112,
+                columns: 16,
+                rows: 4,
+                initial_source_sequence: 10,
+                reserved_v1_compat: [0; 2],
+                history_capacity_rows: 20,
+                reserved_v2_compat: [0; 2],
+                output_profile: 0,
+                reserved0: 0,
+                reserved_v3_compat: [0; 2],
+                width_profile: 2,
+                reserved1: 0,
+                reserved: [0; 2],
+            };
+            let mut terminal = ptr::null_mut();
+            for bad in [
+                TlTerminalConfigV4 {
+                    width_profile: 0,
+                    ..config
+                },
+                TlTerminalConfigV4 {
+                    width_profile: 3,
+                    ..config
+                },
+                TlTerminalConfigV4 {
+                    struct_size: 88,
+                    ..config
+                },
+                TlTerminalConfigV4 {
+                    reserved_v3_compat: [1, 0],
+                    ..config
+                },
+                TlTerminalConfigV4 {
+                    reserved1: 1,
+                    ..config
+                },
+            ] {
+                assert_eq!(
+                    tl_terminal_create_v4(&bad, &mut terminal),
+                    STATUS_INVALID_ARGUMENT
+                );
+                assert!(terminal.is_null());
+            }
+            assert_eq!(tl_terminal_create_v4(&config, &mut terminal), STATUS_OK);
+            assert_eq!(
+                tl_terminal_apply_event(
+                    terminal,
+                    &output(10, "🇨🇳👨\u{200d}👩\u{200d}👧\u{200d}👦".as_bytes())
+                ),
+                STATUS_OK
+            );
+            let frozen = checkpoint(terminal);
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v3(
+                    frozen,
+                    MAX_RENDER_FRAME_V3_BYTES as u64,
+                    &mut buffer
+                ),
+                STATUS_RENDER_FRAME_VERSION_REQUIRED
+            );
+            assert!(buffer.data.is_null());
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v4(frozen, 0, &mut buffer),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v4(frozen, 1, &mut buffer),
+                STATUS_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v4(
+                    frozen,
+                    MAX_RENDER_FRAME_V4_BYTES as u64,
+                    &mut buffer
+                ),
+                STATUS_OK
+            );
+            let frame = copy_and_free(buffer);
+            assert_eq!(&frame[..8], b"TLRFRM4\0");
+            assert_eq!(u32_at(&frame, 60), 2);
+            assert!(
+                frame
+                    .windows(25)
+                    .any(|bytes| bytes == "👨\u{200d}👩\u{200d}👧\u{200d}👦".as_bytes())
+            );
+            assert_eq!(
+                tl_terminal_apply_event(terminal, &output(11, b"still usable")),
+                STATUS_OK
+            );
+            let mut buffer = empty_buffer();
+            assert_eq!(
+                tl_terminal_checkpoint_export_render_frame_v4(
+                    frozen,
+                    MAX_RENDER_FRAME_V4_BYTES as u64,
+                    &mut buffer
+                ),
+                STATUS_OK
+            );
+            assert_eq!(copy_and_free(buffer), frame);
+            tl_terminal_checkpoint_destroy(frozen);
+            tl_terminal_destroy(terminal);
         }
     }
 
@@ -4061,6 +5864,67 @@ mod tests {
         );
         // SAFETY: Test releases its live terminal exactly once.
         unsafe { tl_terminal_destroy(terminal) };
+    }
+
+    #[test]
+    fn legacy_projection_is_atomic_owned_and_preflights_output() {
+        let terminal = create(&config(20, 3, 0)).expect("create");
+        let mut frame = empty_buffer();
+        let mut invalid = empty_buffer();
+        invalid.abi_version = 999;
+        // SAFETY: Live handle, readable event and writable buffers owned by this test.
+        unsafe {
+            for (mode, expected) in [(1, STATUS_LIMIT_EXCEEDED), (2, STATUS_PANIC)] {
+                PENDING_BUFFER_TEST_MODE.with(|value| value.set(mode));
+                assert_eq!(
+                    tl_terminal_apply_event_with_legacy_projection_v1(
+                        terminal,
+                        &output(0, b"uncommitted\x07"),
+                        &mut frame
+                    ),
+                    expected
+                );
+                assert!(frame.data.is_null());
+                assert_eq!(
+                    PENDING_BUFFER_TEST_LAST_KEY.with(std::cell::Cell::get),
+                    PENDING_BUFFER_TEST_ROLLED_BACK_KEY.with(std::cell::Cell::get)
+                );
+            }
+            assert_eq!(
+                tl_terminal_apply_event_with_legacy_projection_v1(
+                    terminal,
+                    &output(0, b"bad"),
+                    &mut invalid
+                ),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                tl_terminal_apply_event_with_legacy_projection_v1(
+                    terminal,
+                    &output(0, b"ok\x07"),
+                    &mut frame
+                ),
+                STATUS_OK
+            );
+            let bytes = copy_and_free(frame);
+            assert_eq!(&bytes[..8], b"TLPJ1\0\0\0");
+            let effects_len = u32_at(&bytes, 8) as usize;
+            assert_eq!(u32_at(&bytes, 12), 2);
+            assert_eq!(&bytes[16..24], b"TLHEF2\0\0");
+            assert_eq!(&bytes[16 + effects_len..], b"ok");
+            let mut rejected = empty_buffer();
+            assert_eq!(
+                tl_terminal_apply_event_with_legacy_projection_v1(
+                    terminal,
+                    &output(1, b"\x1b[999t"),
+                    &mut rejected
+                ),
+                STATUS_UNSUPPORTED
+            );
+            assert!(rejected.data.is_null());
+            assert_eq!(rejected.len, 0);
+            tl_terminal_destroy(terminal);
+        }
     }
 
     #[test]
@@ -5396,6 +7260,168 @@ mod tests {
     }
 
     #[test]
+    fn input_diagnostic_abi_reports_exact_scalar_and_preserves_old_encoder() {
+        let terminal = create(&config(8, 2, 0)).expect("create");
+        let rejected = input(
+            INPUT_KIND_KEY,
+            INPUT_KEY_CHARACTER,
+            INPUT_MODIFIER_CONTROL,
+            'é' as u32,
+        );
+        // SAFETY: The test owns one live terminal and independent empty outputs.
+        unsafe {
+            let mut encoded = empty_buffer();
+            let mut diagnostic = empty_buffer();
+            assert_eq!(
+                tl_terminal_encode_input_v1_with_diagnostic(
+                    terminal,
+                    &rejected,
+                    &mut encoded,
+                    &mut diagnostic,
+                ),
+                STATUS_UNSUPPORTED,
+            );
+            assert!(encoded.data.is_null());
+            let detail = String::from_utf8(copy_and_free(diagnostic)).expect("ASCII diagnostic");
+            assert_eq!(
+                detail,
+                "TL-INPUT-DIAG/1\ndirection=input_encoding\nstatus=unsupported\nkind=key\nreason=unsupported_control_character\nkey=Character\ncodepoint=U+00E9\nmodifiers=0x04\n"
+            );
+            let mut legacy_output = empty_buffer();
+            assert_eq!(
+                tl_terminal_encode_input_v1(terminal, &rejected, &mut legacy_output),
+                STATUS_UNSUPPORTED,
+            );
+            assert!(legacy_output.data.is_null());
+
+            let accepted = input(INPUT_KIND_KEY, INPUT_KEY_CHARACTER, 0, 'a' as u32);
+            let mut encoded = empty_buffer();
+            let mut diagnostic = empty_buffer();
+            assert_eq!(
+                tl_terminal_encode_input_v1_with_diagnostic(
+                    terminal,
+                    &accepted,
+                    &mut encoded,
+                    &mut diagnostic,
+                ),
+                STATUS_OK,
+            );
+            assert_eq!(copy_and_free(encoded), b"a");
+            assert!(diagnostic.data.is_null() && diagnostic.len == 0);
+            tl_terminal_destroy(terminal);
+        }
+    }
+
+    #[test]
+    fn input_diagnostic_abi_checks_independent_empty_outputs_before_encoding() {
+        let terminal = create(&config(8, 2, 0)).expect("create");
+        let key = input(INPUT_KIND_KEY, INPUT_KEY_CHARACTER, 0, 'a' as u32);
+        // SAFETY: Outputs are writable stack allocations; the test checks
+        // rejection before any overlapping or occupied buffer is written.
+        unsafe {
+            let mut aliased = empty_buffer();
+            assert_eq!(
+                tl_terminal_encode_input_v1_with_diagnostic(
+                    terminal,
+                    &key,
+                    &mut aliased,
+                    &mut aliased,
+                ),
+                STATUS_INVALID_ARGUMENT,
+            );
+            assert!(aliased.data.is_null() && aliased.len == 0);
+            let mut encoded = empty_buffer();
+            let mut occupied = empty_buffer();
+            occupied.len = 1;
+            assert_eq!(
+                tl_terminal_encode_input_v1_with_diagnostic(
+                    terminal,
+                    &key,
+                    &mut encoded,
+                    &mut occupied,
+                ),
+                STATUS_INVALID_ARGUMENT,
+            );
+            assert!(encoded.data.is_null() && encoded.len == 0);
+            assert!(occupied.data.is_null() && occupied.len == 1);
+            tl_terminal_destroy(terminal);
+        }
+    }
+
+    #[test]
+    fn input_diagnostic_abi_covers_v2_v3_and_mouse() {
+        let terminal = create(&config(8, 2, 0)).expect("create");
+        let mut v2 = input_v2(INPUT_KIND_KEY);
+        v2.key = INPUT_KEY_CHARACTER;
+        v2.character = 'é' as u32;
+        v2.modifiers = INPUT_MODIFIER_CONTROL;
+        let mut v3 = input_v3(INPUT_KIND_KEY);
+        v3.key = INPUT_KEY_CHARACTER;
+        v3.character = 'é' as u32;
+        v3.modifiers = INPUT_MODIFIER_CONTROL;
+        let mouse = mouse_input(
+            MOUSE_ACTION_PRESS,
+            MOUSE_BUTTON_LEFT,
+            MOUSE_WHEEL_NONE,
+            0,
+            1,
+            1,
+        );
+        // SAFETY: All ABI inputs are fully initialized and outputs are owned.
+        unsafe {
+            for status_and_detail in [
+                {
+                    let mut output = empty_buffer();
+                    let mut detail = empty_buffer();
+                    let status = tl_terminal_encode_input_v2_with_diagnostic(
+                        terminal,
+                        &v2,
+                        &mut output,
+                        &mut detail,
+                    );
+                    assert!(output.data.is_null());
+                    (status, copy_and_free(detail))
+                },
+                {
+                    let mut output = empty_buffer();
+                    let mut detail = empty_buffer();
+                    let status = tl_terminal_encode_input_v3_with_diagnostic(
+                        terminal,
+                        &v3,
+                        &mut output,
+                        &mut detail,
+                    );
+                    assert!(output.data.is_null());
+                    (status, copy_and_free(detail))
+                },
+            ] {
+                assert_eq!(status_and_detail.0, STATUS_UNSUPPORTED);
+                assert!(
+                    status_and_detail
+                        .1
+                        .windows(b"codepoint=U+00E9\n".len())
+                        .any(|window| window == b"codepoint=U+00E9\n")
+                );
+            }
+            let mut output = empty_buffer();
+            let mut detail = empty_buffer();
+            assert_eq!(
+                tl_terminal_encode_mouse_input_v1_with_diagnostic(
+                    terminal,
+                    &mouse,
+                    &mut output,
+                    &mut detail,
+                ),
+                STATUS_INVALID_ARGUMENT,
+            );
+            assert!(output.data.is_null());
+            let detail = String::from_utf8(copy_and_free(detail)).expect("ASCII diagnostic");
+            assert!(detail.contains("kind=mouse\nreason=invalid_mouse_button_state\n"));
+            tl_terminal_destroy(terminal);
+        }
+    }
+
+    #[test]
     fn semantic_focus_input_abi_tracks_mode_and_snapshot_restore() {
         let terminal = create(&config(8, 2, 0)).expect("create");
         let focus_gained = input(INPUT_KIND_FOCUS_GAINED, 0, 0, 0);
@@ -6669,18 +8695,24 @@ mod tests {
         assert!(header.contains("tl_terminal_apply_event_batch_with_host_effects_v1"));
         assert!(header.contains("tl_terminal_apply_event_with_host_effects_v2"));
         assert!(header.contains("tl_terminal_apply_event_batch_with_host_effects_v2"));
+        assert!(header.contains("typedef struct TlTerminalBrokerRequestV1"));
+        assert!(header.contains("static_assert(sizeof(TlTerminalBrokerRequestV1) == 96"));
+        assert!(header.contains("tl_terminal_broker_commit_v1"));
         assert!(header.contains("static_assert(sizeof(TlTerminalEvent) == 56"));
         assert!(header.contains("_Static_assert(sizeof(TlTerminalBuffer) == 24"));
         assert!(header.contains("tl_terminal_encode_input_v1"));
+        assert!(header.contains("tl_terminal_encode_input_v1_with_diagnostic"));
         assert!(header.contains("typedef struct TlTerminalInputV1"));
         assert!(header.contains("static_assert(sizeof(TlTerminalInputV1) == 56"));
         assert!(header.contains("#define TL_INPUT_KIND_WIN32_KEY UINT32_C(5)"));
         assert!(header.contains("tl_terminal_input_v2_struct_size"));
         assert!(header.contains("tl_terminal_encode_input_v2"));
+        assert!(header.contains("tl_terminal_encode_input_v2_with_diagnostic"));
         assert!(header.contains("typedef struct TlTerminalInputV2"));
         assert!(header.contains("static_assert(sizeof(TlTerminalInputV2) == 96"));
         assert!(header.contains("tl_terminal_input_v3_struct_size"));
         assert!(header.contains("tl_terminal_encode_input_v3"));
+        assert!(header.contains("tl_terminal_encode_input_v3_with_diagnostic"));
         assert!(header.contains("typedef struct TlTerminalInputV3"));
         assert!(header.contains("static_assert(sizeof(TlTerminalInputV3) == 160"));
         assert!(header.contains("#define TL_INPUT_KIND_KITTY_KEY UINT32_C(6)"));
@@ -6691,6 +8723,8 @@ mod tests {
         assert!(header.contains("#define TL_INPUT_KEY_UNIDENTIFIED_TEXT UINT32_MAX"));
         assert!(header.contains("tl_terminal_mouse_input_v1_struct_size"));
         assert!(header.contains("tl_terminal_encode_mouse_input_v1"));
+        assert!(header.contains("tl_terminal_encode_mouse_input_v1_with_diagnostic"));
+        assert!(header.contains("#define TL_INPUT_DIAGNOSTIC_V1_MAX_BYTES UINT64_C(2048)"));
         assert!(header.contains("typedef struct TlTerminalMouseInputV1"));
         assert!(header.contains("#define TL_MOUSE_ACTION_PRESS UINT32_C(1)"));
         assert!(header.contains("#define TL_MOUSE_ACTION_RELEASE UINT32_C(2)"));

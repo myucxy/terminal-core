@@ -1,5 +1,160 @@
 use super::*;
 
+#[test]
+fn horizontal_index_scrolls_only_the_margin_rectangle_and_preserves_cursor() {
+    for forward in [false, true] {
+        let mut terminal = Terminal::new(8, 4).unwrap();
+        output(&mut terminal, 0, b"ABCDEFGH\x1b[2;1Habcdefgh\x1b[3;1H12345678\x1b[4;1HQRSTUVWX\x1b[?69h\x1b[3;6s\x1b[2;3r").unwrap();
+        let command = if forward {
+            b"\x1b[2;6H\x1b9".as_slice()
+        } else {
+            b"\x1b[2;3H\x1b6".as_slice()
+        };
+        output(&mut terminal, 1, command).unwrap();
+        assert_eq!(row_text(&terminal, 0), "ABCDEFGH");
+        assert_eq!(
+            row_text(&terminal, 1),
+            if forward { "abdef gh" } else { "ab cdegh" }
+        );
+        assert_eq!(
+            row_text(&terminal, 2),
+            if forward { "12456 78" } else { "12 34578" }
+        );
+        assert_eq!(row_text(&terminal, 3), "QRSTUVWX");
+        assert_eq!(terminal.active_screen().cursor_row, 1);
+        assert_eq!(
+            terminal.active_screen().cursor_column,
+            if forward { 5 } else { 2 }
+        );
+        let snapshot = terminal.export_snapshot_v2().unwrap();
+        assert_eq!(Terminal::import_snapshot_v2(&snapshot).unwrap(), terminal);
+    }
+}
+
+#[test]
+fn horizontal_index_outside_vertical_margins_moves_without_scrolling_or_wrapping() {
+    let mut terminal = Terminal::new(8, 4).unwrap();
+    output(
+        &mut terminal,
+        0,
+        b"ABCDEFGH\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[1;3H\x1b6",
+    )
+    .unwrap();
+    assert_eq!(terminal.active_screen().cursor_column, 1);
+    output(&mut terminal, 1, b"\x1b[1;6H\x1b9").unwrap();
+    assert_eq!(terminal.active_screen().cursor_column, 6);
+    output(&mut terminal, 2, b"\x1b[1;8H\x1b9\x1b9").unwrap();
+    assert_eq!(terminal.active_screen().cursor_column, 7);
+    output(&mut terminal, 3, b"\x1b[1;1H\x1b6\x1b6").unwrap();
+    assert_eq!(terminal.active_screen().cursor_column, 0);
+    assert_eq!(row_text(&terminal, 0), "ABCDEFGH");
+}
+
+#[test]
+fn horizontal_index_cancels_wrap_repairs_wide_cells_and_never_appends_history() {
+    let mut terminal = Terminal::new_with_options(
+        6,
+        2,
+        0,
+        TerminalOptions {
+            history_capacity_rows: 20,
+        },
+    )
+    .unwrap();
+    output(&mut terminal, 0, b"old\r\nnew\r\n123456").unwrap();
+    let history = terminal.main.viewport_top();
+    assert!(terminal.active_screen().wrap_pending);
+    output(&mut terminal, 1, b"\x1b9X").unwrap();
+    assert_eq!(row_text(&terminal, 1), "23456X");
+    assert_eq!(terminal.main.viewport_top(), history);
+    output(
+        &mut terminal,
+        2,
+        "\x1b[?1049h\x1b[1;1H中ABCD\x1b[2;1H12界34\x1b[1;6H\x1b9".as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(row_text(&terminal, 0), " ABCD ");
+    assert_eq!(row_text(&terminal, 1), "2界·34 ");
+    let snapshot = terminal.export_snapshot_v2().unwrap();
+    assert_eq!(Terminal::import_snapshot_v2(&snapshot).unwrap(), terminal);
+    output(&mut terminal, 3, b"\x1b[?1049l").unwrap();
+    assert_eq!(terminal.main.viewport_top(), history);
+    assert_eq!(row_text(&terminal, 1), "23456X");
+}
+
+#[test]
+fn decst8c_restores_default_tabs_including_hidden_columns_and_preserves_cursor() {
+    for command in [b"\x1b[?5W".as_slice(), b"\x1b[?W"] {
+        let mut terminal = Terminal::new(24, 2).unwrap();
+        output(&mut terminal, 0, b"\x1b[3g\x1b[1;4H\x1bH").unwrap();
+        terminal
+            .apply_event(Event::Resize {
+                source_sequence: 1,
+                columns: 10,
+                rows: 2,
+            })
+            .unwrap();
+        output(&mut terminal, 2, command).unwrap();
+        assert_eq!(terminal.active_screen().cursor_column, 3);
+        assert!(!terminal.tabs.get(3));
+        assert!(terminal.tabs.get(8));
+        assert!(terminal.tabs.get(16));
+        terminal
+            .apply_event(Event::Resize {
+                source_sequence: 3,
+                columns: 24,
+                rows: 2,
+            })
+            .unwrap();
+        output(&mut terminal, 4, b"\r\t\t").unwrap();
+        assert_eq!(terminal.active_screen().cursor_column, 16);
+        let snapshot = terminal.export_snapshot_v2().unwrap();
+        let mut restored = Terminal::import_snapshot_v2(&snapshot).unwrap();
+        output(&mut restored, 5, b"\x1b[Z").unwrap();
+        assert_eq!(restored.active_screen().cursor_column, 8);
+    }
+}
+
+#[test]
+fn editing_sequences_are_invariant_at_every_event_split() {
+    let bytes = b"12345678\x1b[2;1Habcdefgh\x1b[1;1H\x1b6\x1b[2;8H\x1b9\x1b[3g\x1b[?5W\r\t";
+    let mut whole = Terminal::new(8, 2).unwrap();
+    output(&mut whole, 0, bytes).unwrap();
+    whole
+        .apply_event(Event::Output {
+            source_sequence: 1,
+            bytes: b"",
+        })
+        .unwrap();
+    for split in 0..=bytes.len() {
+        let mut terminal = Terminal::new(8, 2).unwrap();
+        output(&mut terminal, 0, &bytes[..split]).unwrap();
+        output(&mut terminal, 1, &bytes[split..]).unwrap();
+        assert_eq!(
+            terminal.export_snapshot_v2().unwrap(),
+            whole.export_snapshot_v2().unwrap(),
+            "split {split}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_tab_selectors_roll_back_with_the_exact_sequence() {
+    for bytes in [b"\x1b[?4W".as_slice(), b"\x1b[?5;5W", b"\x1b[?5:1W"] {
+        let mut terminal = Terminal::new(24, 2).unwrap();
+        let mut expected = terminal.clone();
+        expected.failed_closed = true;
+        assert!(output(&mut terminal, 0, bytes).is_err());
+        assert_eq!(terminal, expected);
+        assert!(
+            terminal
+                .failure_diagnostic_v1()
+                .unwrap()
+                .contains("family=CSI\nsequence=<ESC>[?")
+        );
+    }
+}
+
 fn output(terminal: &mut Terminal, sequence: u64, bytes: &[u8]) -> Result<(), TerminalError> {
     terminal.apply_event(Event::Output {
         source_sequence: sequence,
@@ -37,7 +192,7 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("u64 field"))
 }
 
-fn host_effect_payloads(frame: &[u8]) -> Vec<&[u8]> {
+pub(super) fn host_effect_payloads(frame: &[u8]) -> Vec<&[u8]> {
     let count = usize::try_from(u32_at(frame, 16)).expect("record count");
     let payload_offset = usize::try_from(u64_at(frame, 32)).expect("payload offset");
     (0..count)
@@ -2019,6 +2174,7 @@ fn reflow_amplification_is_preflighted_before_layout_allocation() {
     let mut malicious = Screen::new(1, 1);
     malicious.cells = vec![Cell::default(); MAX_CELLS];
     malicious.soft_wrapped = vec![false; MAX_CELLS];
+    malicious.line_renditions = vec![LineRendition::SingleWidth; MAX_CELLS];
     malicious.meaningful_end = vec![1; MAX_CELLS];
     assert_eq!(
         malicious.validate_reflow_target(512),
@@ -2027,6 +2183,14 @@ fn reflow_amplification_is_preflighted_before_layout_allocation() {
     assert_eq!(malicious.validate(), Err(TerminalError::MalformedSnapshot));
 
     let terminal = Terminal {
+        pages: crate::pages::PageStore::default(),
+        host_geometry: HostGeometryV1::default(),
+        shell_integration: crate::ShellIntegration::default(),
+        host_signals: crate::HostSignalsV1::default(),
+        graphics: None,
+        kitty_transfer: crate::kitty_graphics::TransferDecoder::default(),
+        broker_replay: None,
+        legacy_projection: None,
         columns: 512,
         rows: 1,
         main: malicious,
@@ -2043,6 +2207,7 @@ fn reflow_amplification_is_preflighted_before_layout_allocation() {
         charset: CharsetState::default(),
         main_saved_charset: CharsetState::default(),
         alternate_saved_charset: CharsetState::default(),
+        user_preferred_charset: charset::CharsetDesignation::LATIN1,
         osc: OscState::default(),
         next_source_sequence: 0,
         logical_time_micros: 0,
@@ -2052,7 +2217,11 @@ fn reflow_amplification_is_preflighted_before_layout_allocation() {
         utf8: Utf8Decoder::default(),
         string_utf8: StringUtf8Boundary::default(),
         repeat_source: None,
+        sgr_stack: sgr_stack::SgrStack::default(),
+        macros: macros::MacroStore::default(),
+        macro_execution: macros::MacroExecution::default(),
         failed_closed: false,
+        diagnostics: diagnostic::OutputDiagnostics::default(),
     };
     let malicious_snapshot =
         snapshot::export_unchecked_for_test(&terminal).expect("malicious snapshot fixture");
@@ -3738,12 +3907,10 @@ fn primary_and_secondary_device_attributes_are_exact_reply_only_queries() {
     assert_snapshot_self_closure(&terminal);
 
     for bytes in [b"\x1b[1c".as_slice(), b"\x1b[>1c".as_slice()] {
-        let mut invalid = Terminal::new(4, 1).expect("terminal");
-        assert!(matches!(
-            output(&mut invalid, 0, bytes),
-            Err(TerminalError::Unsupported(_))
-        ));
-        assert!(invalid.is_failed_closed());
+        let mut optional = Terminal::new(4, 1).expect("terminal");
+        output(&mut optional, 0, bytes).expect("unknown read-only DA selector is ignored");
+        assert!(!optional.is_failed_closed());
+        assert_eq!(optional.cursor(), (0, 0));
     }
 }
 
@@ -3870,7 +4037,7 @@ fn color_scheme_reporting_mode_sets_queries_resets_and_is_split_safe() {
         .expect("mode 2031 set, query, reset, and query");
     assert_eq!(
         host_effect_payloads(prepared.host_effect_frame_v2()),
-        [b"\x1b[?2031;1$y".as_slice(), b"\x1b[?2031;2$y".as_slice(),]
+        [b"\x1b[?2031;0$y".as_slice(), b"\x1b[?2031;0$y".as_slice(),]
     );
     prepared
         .commit_with(|_| Ok::<(), ()>(()))
@@ -3903,7 +4070,19 @@ fn xtversion_query_has_one_canonical_v2_reply_and_strict_parameters() {
         .commit_with(|_| Ok::<(), ()>(()))
         .expect("publish and commit XTVERSION reply");
 
-    for malformed in [&b"\x1b[>1q"[..], b"\x1b[>0;0q", b"\x1b[?0q", b"\x1b[0q"] {
+    for optional in [&b"\x1b[>1q"[..], b"\x1b[>0;0q"] {
+        let mut terminal = Terminal::new(8, 2).unwrap();
+        let prepared = terminal
+            .prepare_event_with_host_effects_v2(Event::Output {
+                source_sequence: 0,
+                bytes: optional,
+            })
+            .unwrap();
+        assert!(host_effect_payloads(prepared.host_effect_frame_v2()).is_empty());
+        prepared.publish(|_| Ok::<(), ()>(())).unwrap();
+        output(&mut terminal, 1, b"OK").unwrap();
+    }
+    for malformed in [&b"\x1b[?0q"[..], b"\x1b[0q"] {
         let mut malformed_terminal = Terminal::new(8, 2).expect("terminal");
         assert!(matches!(
             malformed_terminal.prepare_event_with_host_effects_v2(Event::Output {
@@ -3962,7 +4141,7 @@ fn alternate_scroll_hint_preserves_replay_snapshot_and_input_modes() {
         .expect("hint in a supported mode list");
     assert_eq!(
         host_effect_payloads(prepared.host_effect_frame_v2()),
-        [b"\x1b[?1007;0$y".as_slice(), b"\x1b[?1004;1$y".as_slice()]
+        [b"\x1b[?1007;1$y".as_slice(), b"\x1b[?1004;1$y".as_slice()]
     );
     prepared.commit_with(|_| Ok::<(), ()>(())).expect("commit");
 
@@ -4027,7 +4206,7 @@ fn text_area_pixel_query_is_an_exact_no_reply_probe() {
         .expect("commit no-reply pixel query");
     assert_eq!(terminal.next_source_sequence(), 1);
 
-    for malformed in [&b"\x1b[14;0t"[..], b"\x1b[13t"] {
+    for malformed in [&b"\x1b[14:0t"[..], b"\x1b[13t"] {
         let mut malformed_terminal = Terminal::new(8, 2).expect("terminal");
         assert!(matches!(
             malformed_terminal.prepare_event_with_host_effects_v2(Event::Output {
@@ -4038,6 +4217,228 @@ fn text_area_pixel_query_is_an_exact_no_reply_probe() {
         ));
         assert_eq!(malformed_terminal.next_source_sequence(), 0);
     }
+}
+
+#[test]
+fn geometry_queries_survive_claude_startup_splits_and_checkpoint_replay() {
+    let bytes = b"\x1b[?2026$p\x1b[16t\x1b[?1016$p\x1b[c\x1b[18tOK";
+    let replies = [
+        b"\x1b[?2026;2$y".to_vec(),
+        b"\x1b[?1016;2$y".to_vec(),
+        b"\x1b[?1;2c".to_vec(),
+        b"\x1b[8;3;12t".to_vec(),
+    ];
+    for split in 0..=bytes.len() {
+        let mut terminal = Terminal::new(12, 3).expect("terminal");
+        let mut actual = Vec::new();
+        for (index, part) in [&bytes[..split], &bytes[split..]].into_iter().enumerate() {
+            let prepared = terminal
+                .prepare_event_with_host_effects_v2(Event::Output {
+                    source_sequence: index as u64,
+                    bytes: part,
+                })
+                .expect("Claude startup query fragment");
+            actual.extend(
+                host_effect_payloads(prepared.host_effect_frame_v2())
+                    .into_iter()
+                    .map(<[u8]>::to_vec),
+            );
+            prepared.commit_with(|_| Ok::<(), ()>(())).expect("commit");
+            match terminal.export_snapshot_v2() {
+                Ok(checkpoint) => {
+                    terminal =
+                        Terminal::import_snapshot_v2(&checkpoint).expect("restore checkpoint");
+                }
+                Err(TerminalError::SnapshotNotEligible) if index == 0 => {
+                    assert!(
+                        !terminal.is_failed_closed(),
+                        "partial query is only a snapshot boundary"
+                    );
+                }
+                other => panic!("unexpected checkpoint result: {other:?}"),
+            }
+        }
+        assert_eq!(actual, replies, "split {split}");
+        assert_eq!(row_text(&terminal, 0), "OK          ");
+        output(&mut terminal, 2, b"!").expect("shell remains usable");
+        assert_snapshot_self_closure(&terminal);
+    }
+}
+
+#[test]
+fn geometry_probe_fallback_does_not_relax_state_changing_commands() {
+    for bytes in [
+        b"\x1b[14t".as_slice(),
+        b"\x1b[14;2t",
+        b"\x1b[15t",
+        b"\x1b[16t",
+        b"\x1b[19t",
+        b"\x1b[14;0t",
+        b"\x1b[16;999;0;1t",
+        b"\x1b[18;2t",
+        b"\x1b[19;t",
+    ] {
+        let mut terminal = Terminal::new(12, 3).expect("terminal");
+        let prepared = terminal
+            .prepare_event_with_host_effects_v2(Event::Output {
+                source_sequence: 0,
+                bytes,
+            })
+            .expect("optional geometry query");
+        assert!(host_effect_payloads(prepared.host_effect_frame_v2()).is_empty());
+        prepared.commit_with(|_| Ok::<(), ()>(())).expect("commit");
+        output(&mut terminal, 1, b"A").expect("subsequent text");
+        assert!(!terminal.is_failed_closed());
+    }
+    for bytes in [
+        b"\x1b[8;4;6t".as_slice(),
+        b"\x1b[?9999h",
+        b"\x1b[14:2t",
+        b"\x1bPq~\x1b\\",
+    ] {
+        let mut terminal = Terminal::new(12, 3).expect("terminal");
+        assert!(matches!(
+            output(&mut terminal, 0, bytes),
+            Err(TerminalError::Unsupported(_))
+        ));
+        assert!(terminal.is_failed_closed());
+        assert_eq!(terminal.next_source_sequence(), 0);
+    }
+    let mut terminal = Terminal::new(12, 3).expect("terminal");
+    terminal
+        .apply_event(Event::Resize {
+            source_sequence: 0,
+            columns: 40,
+            rows: 10,
+        })
+        .expect("resize");
+    let prepared = terminal
+        .prepare_event_with_host_effects_v2(Event::Output {
+            source_sequence: 1,
+            bytes: b"\x1b[18t",
+        })
+        .expect("geometry after resize");
+    assert_eq!(
+        host_effect_payloads(prepared.host_effect_frame_v2()),
+        [b"\x1b[8;10;40t".as_slice()]
+    );
+}
+
+#[test]
+fn text_size_reply_requires_v2_without_poisoning_a_v1_caller() {
+    let mut terminal = Terminal::new(12, 3).expect("terminal");
+    assert!(matches!(
+        terminal.prepare_event_with_host_effects_v1(Event::Output {
+            source_sequence: 0,
+            bytes: b"\x1b[18t",
+        }),
+        Err(TerminalError::HostEffectVersionRequired)
+    ));
+    assert!(!terminal.is_failed_closed());
+    assert_eq!(terminal.next_source_sequence(), 0);
+    let prepared = terminal
+        .prepare_event_with_host_effects_v2(Event::Output {
+            source_sequence: 0,
+            bytes: b"\x1b[18t",
+        })
+        .expect("same-sequence V2 retry");
+    assert_eq!(
+        host_effect_payloads(prepared.host_effect_frame_v2()),
+        [b"\x1b[8;3;12t".as_slice()]
+    );
+}
+
+#[test]
+fn incomplete_capabilities_are_not_advertised_even_from_legacy_snapshots() {
+    let mut terminal = Terminal::new(12, 3).expect("terminal");
+    output(&mut terminal, 0, b"\x1b[?2027;2031h").expect("legacy stored flags");
+    let snapshot = terminal
+        .export_snapshot_v2()
+        .expect("legacy flags snapshot");
+    let mut terminal = Terminal::import_snapshot_v2(&snapshot).expect("restore flags");
+    assert_eq!(terminal.export_snapshot_v2().unwrap(), snapshot);
+    let prepared = terminal
+        .prepare_event_with_host_effects_v2(Event::Output {
+            source_sequence: 1,
+            bytes: b"\x1b[?2027$p\x1b[?2031$p",
+        })
+        .expect("honest capabilities");
+    assert_eq!(
+        host_effect_payloads(prepared.host_effect_frame_v2()),
+        [b"\x1b[?2027;0$y".as_slice(), b"\x1b[?2031;0$y"]
+    );
+}
+
+#[test]
+fn soft_reset_preserves_history_cells_position_tabs_and_transport_modes() {
+    let mut terminal = Terminal::new_with_options(
+        12,
+        3,
+        0,
+        TerminalOptions {
+            history_capacity_rows: 20,
+        },
+    )
+    .expect("terminal");
+    output(&mut terminal, 0, b"ONE\r\nTWO\r\nTHREE\r\nFOUR\x1b[3g\x1b[4G\x1bH\x1b]2;title\x07\x1b[?9001;2004;1004;1000h\x1b[?69h\x1b[2;10s\x1b[2;3r\x1b[?6;1;66h\x1b[4h\x1b[?7;25l\x1b[31;1m\x1b[1\"q\x1b7").expect("configure state");
+    let cells = terminal.main.cells.clone();
+    let metadata = terminal.main.row_metadata.clone();
+    let tabs = terminal.tabs.clone();
+    let cursor = terminal.cursor();
+    let title = terminal.osc.clone();
+    let snapshot = terminal.export_snapshot_v2().expect("before reset");
+    for split in 0..=4 {
+        let mut actual = Terminal::import_snapshot_v2(&snapshot).expect("checkpoint");
+        output(&mut actual, 1, &b"\x1b[!p"[..split]).expect("reset prefix");
+        output(&mut actual, 2, &b"\x1b[!p"[split..]).expect("reset suffix");
+        assert_eq!(actual.main.cells, cells);
+        assert_eq!(actual.main.row_metadata, metadata);
+        assert_eq!(actual.cursor(), cursor);
+        assert_eq!(actual.tabs, tabs);
+        assert_eq!(actual.osc, title);
+        assert_eq!(actual.main.attributes, Attributes::default());
+        assert!(!actual.main.protected);
+        assert_eq!(actual.main.saved, screen::SavedCursor::default());
+        assert_eq!(actual.margins, Margins::full(12, 3));
+        assert!(
+            !actual.modes.insert_mode
+                && !actual.modes.origin_mode
+                && !actual.modes.left_right_margin
+        );
+        assert!(actual.modes.auto_wrap && actual.cursor_visible);
+        assert!(!actual.modes.cursor_keys_application && !actual.modes.keypad_application);
+        assert!(
+            actual.modes.win32_input_mode
+                && actual.modes.bracketed_paste
+                && actual.modes.focus_reporting
+        );
+        assert_eq!(actual.modes.mouse_tracking, terminal.modes.mouse_tracking);
+        assert_snapshot_self_closure(&actual);
+    }
+}
+
+#[test]
+fn soft_reset_only_resets_active_saved_cursor_and_keeps_alternate_screen() {
+    let mut terminal = Terminal::new(12, 3).expect("terminal");
+    output(
+        &mut terminal,
+        0,
+        b"MAIN\x1b[2;4H\x1b[32m\x1b7\x1b[?1049hALT\x1b[31m\x1b7",
+    )
+    .expect("alternate state");
+    let saved_main = terminal.main.saved;
+    let saved_charset = terminal.main_saved_charset;
+    let cells = terminal.alternate.cells.clone();
+    output(&mut terminal, 1, b"\x1b[!p").expect("soft reset");
+    assert!(terminal.active_alternate);
+    assert_eq!(terminal.alternate.cells, cells);
+    assert_eq!(terminal.main.saved, saved_main);
+    assert_eq!(terminal.main_saved_charset, saved_charset);
+    assert_eq!(terminal.alternate.saved, screen::SavedCursor::default());
+    output(&mut terminal, 2, b"\x1b[?1049l").expect("return to shell");
+    assert_eq!(row_text(&terminal, 0), "MAIN        ");
+    assert_eq!(terminal.cursor(), (saved_main.row, saved_main.column));
+    assert_snapshot_self_closure(&terminal);
 }
 
 #[test]
@@ -4504,7 +4905,7 @@ fn legacy_queries_discard_effects_and_capture_excludes_osc_and_xtqmodkeys() {
 }
 
 #[test]
-fn da_and_status_queries_reject_noncanonical_parameters_fail_closed() {
+fn unsupported_da_and_status_query_values_do_not_change_state_or_mint_replies() {
     for bytes in [
         b"\x1b[1c".as_slice(),
         b"\x1b[>1c".as_slice(),
@@ -4517,15 +4918,17 @@ fn da_and_status_queries_reject_noncanonical_parameters_fail_closed() {
         b"\x1b[?5;6n".as_slice(),
     ] {
         let mut terminal = Terminal::new(4, 2).expect("terminal");
-        assert!(matches!(
-            terminal.prepare_event_with_host_effects_v1(Event::Output {
+        let prepared = terminal
+            .prepare_event_with_host_effects_v1(Event::Output {
                 source_sequence: 0,
                 bytes,
-            }),
-            Err(TerminalError::Unsupported(_))
-        ));
-        assert!(terminal.is_failed_closed(), "{bytes:?}");
-        assert_eq!(terminal.next_source_sequence(), 0);
+            })
+            .expect("optional probe");
+        assert!(host_effect_payloads(prepared.host_effect_frame_v1()).is_empty());
+        prepared.publish(|_| Ok::<(), ()>(())).unwrap();
+        assert!(!terminal.is_failed_closed(), "{bytes:?}");
+        assert_eq!(terminal.next_source_sequence(), 1);
+        assert_eq!(terminal.cursor(), (0, 0));
     }
 }
 
@@ -5090,7 +5493,7 @@ fn deccra_copies_clips_and_handles_overlap_from_a_staged_source() {
 }
 
 #[test]
-fn deccra_coordinates_follow_decom_and_declrmm_and_pages_are_strict() {
+fn deccra_coordinates_follow_decom_and_declrmm_across_pages() {
     let mut terminal = Terminal::new(5, 5).expect("terminal");
     output(
         &mut terminal,
@@ -5115,16 +5518,12 @@ fn deccra_coordinates_follow_decom_and_declrmm_and_pages_are_strict() {
         b"\x1b[1;1;1;1;2;2;2;1$v".as_slice(),
         b"\x1b[1;1;1;1;1;2;2;2$v".as_slice(),
     ] {
-        let mut invalid_page = Terminal::new(5, 2).expect("terminal");
-        output(&mut invalid_page, 0, b"stable").expect("baseline");
-        let before = invalid_page.clone();
-        assert_eq!(
-            output(&mut invalid_page, 1, bytes),
-            Err(TerminalError::Unsupported("DECCRA page"))
-        );
-        let mut expected = before;
-        expected.failed_closed = true;
-        assert_eq!(invalid_page, expected);
+        let mut paged = Terminal::new(5, 2).expect("terminal");
+        output(&mut paged, 0, b"stable").expect("baseline");
+        let cursor = paged.cursor();
+        output(&mut paged, 1, bytes).expect("cross-page copy");
+        assert_eq!(paged.cursor(), cursor);
+        assert_snapshot_self_closure(&paged);
     }
 }
 
@@ -5220,9 +5619,9 @@ fn deccra_is_split_deterministic_alternate_safe_and_event_atomic() {
         output(
             &mut atomic,
             1,
-            b"\x1b[1;1;2;2;1;2;5;1$v\x1b[1;1;1;1;2;1;1;1$v",
+            b"\x1b[1;1;2;2;1;2;5;1$v\x1b[1;1;1;1;2;1;1;1;1$v",
         ),
-        Err(TerminalError::Unsupported("DECCRA page"))
+        Err(TerminalError::Unsupported("DECCRA parameters"))
     );
     let mut failed_closed = before;
     failed_closed.failed_closed = true;
