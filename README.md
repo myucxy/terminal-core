@@ -12,6 +12,8 @@ TermLink 自研的跨平台终端状态引擎，使用 Rust 实现，通过 C AB
 
 预编译依赖包与匹配源码通过 [GitHub Releases](https://github.com/myucxy/terminal-core/releases) 分发，按固定版本、commit 与独立可信签名指纹校验后导入。[发布与消费流程](docs/RELEASE.md)包含本机构建、签名、Draft 上传回验和应用回滚步骤；候选版不代表完整产品验收。
 
+当前候选包：[v0.1.0-rc.1](https://github.com/myucxy/terminal-core/releases/tag/v0.1.0-rc.1) · [发布验证记录](docs/RELEASE_0.1.0-rc.1.md)。
+
 ## 核心能力
 
 | 范围 | 当前代码提供的能力 |

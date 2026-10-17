@@ -12,6 +12,8 @@ Project-owned code uses **[GPL-3.0-only](LICENSE)**. Third-party material retain
 
 Prebuilt dependencies and matching source are distributed through [GitHub Releases](https://github.com/myucxy/terminal-core/releases). Pin the version, commit, and an independently trusted signing-key fingerprint before import. The [release and consumption guide](docs/RELEASE.md) covers local builds, signing, draft upload/download verification, and application rollback. A release candidate is not a full product acceptance claim.
 
+Current candidate: [v0.1.0-rc.1](https://github.com/myucxy/terminal-core/releases/tag/v0.1.0-rc.1) · [release verification record](docs/RELEASE_0.1.0-rc.1.md).
+
 ## Core capabilities
 
 | Area | Available in the current code |
