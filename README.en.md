@@ -8,7 +8,7 @@ It is maintained independently of the [TermLink application](https://github.com/
 
 Project-owned code uses **[GPL-3.0-only](LICENSE)**. Third-party material retains its own terms and attribution; see [NOTICE](NOTICE).
 
-[Quick start](#quick-start) · [Integration and builds](#integration-and-builds) · [Compatibility and safety](#compatibility-and-safety) · [Documentation](#documentation)
+[Quick start](#quick-start) · [Integration and builds](#integration-and-builds) · [Compatibility and safety](#compatibility-and-safety) · [Documentation](#documentation) · [References and acknowledgements](#references-and-acknowledgements)
 
 ## Core capabilities
 
@@ -139,6 +139,28 @@ This repository was split from `terminal-core/` at `myucxy/TermLink@78c011b` on 
 | Graphics and broker | [Resource contract](GRAPHICS_RESOURCE_CONTRACT_20261010.md), [graphics implementation](S6_GRAPHICS_IN_PROGRESS_20261010.md), [Windows broker](G01_WINDOWS_BROKER_DESIGN_20261010.md) |
 | Text and host state | [Unicode 16](S1_S4_REPORTS_UNICODE_BASELINE_20261009.md), [line renditions](S2_LINE_RENDITIONS_20261009.md), [themes](S2_HOST_THEME_20261010.md), [persistent session profiles](S1_PERSISTENT_SESSION_PROFILE_20261010.md) |
 | Dependencies and earlier notes | [Rust dependency provenance](third_party/rust-dependencies/README.md), [previous README implementation notes](docs/archive/README_IMPLEMENTATION_NOTES.md) |
+
+## References and acknowledgements
+
+Thanks to the following open-source projects and their maintainers. This list records the scope of our references, distinguishing protocol and behavior comparisons, earlier design research, and third-party material actually used.
+
+| Project | Reference scope and relationship |
+| --- | --- |
+| [Microsoft Windows Terminal](https://github.com/microsoft/terminal) | Referenced for VT/CSI/OSC, query replies, Unicode, colors, and window behavior. Source comparisons are pinned to [`6676c6f`](https://github.com/microsoft/terminal/commit/6676c6f938f7e98ad680f0cecedd3bafb6529734); see the [capability review](WINDOWS_TERMINAL_CAPABILITY_REVIEW_20261009.md). Fixed character mapping data from that revision's `charsets.hpp` is actually used with MIT attribution and license notices; see its [provenance](third_party/legacy-charsets/README.md). Its parser, state machine, and renderer implementations are not included. |
+| [xterm](https://invisible-island.net/xterm/) | The [control sequence documentation](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html) informs query replies, terminal modes, SGR, OSC, input encoding, and compatibility behavior. The core implements its own bounded subset. |
+| [kitty](https://github.com/kovidgoyal/kitty) | The official [keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) and [graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) inform input negotiation, image transfer, placement, and related semantics. Supported behavior is defined by this repository's profiles and [graphics resource contract](GRAPHICS_RESOURCE_CONTRACT_20261010.md); kitty's terminal implementation is not reused. |
+| [Termux](https://github.com/termux/termux-app) | Referenced during TermLink's early Android engine selection and terminal interaction research. The application previously used derived modules, which have since been retired. The current Rust core and Android JNI do not depend on Termux modules or use Termux differential results as acceptance gates; see the application's [migration record](https://github.com/myucxy/TermLink/blob/main/docs/archive/TERMUX_CLEANUP_20261008.md). |
+| [xterm.js](https://github.com/xtermjs/xterm.js) | Referenced during TermLink's early WebView terminal design, compatibility comparisons, and theme research. It is not a runtime dependency of this Rust core. |
+| [ConnectBot termlib](https://github.com/connectbot/termlib) | Referenced during early Android native terminal and libvterm integration research. Its implementation is not integrated into this core. The application's [engine research](https://github.com/myucxy/TermLink/blob/main/docs/ANDROID_TERMINAL_ENGINE_RESEARCH.md) records this and the xterm.js evaluation; it describes the historical design, not the current architecture. |
+
+This repository also actually uses the following data and dependencies, with their licenses and provenance retained:
+
+| Data or dependency | Purpose and provenance |
+| --- | --- |
+| [Unicode 16.0.0](https://www.unicode.org/Public/16.0.0/ucd/) | Grapheme, width, and emoji properties plus official conformance data, under Unicode License V3. Pinned inputs and hashes are documented in the [source inventory](third_party/unicode/16.0.0/SOURCE.md). |
+| [RustCrypto / sha2](https://github.com/RustCrypto/hashes/tree/master/sha2) | `sha2 = "=0.10.9"` supplies SHA-256 for State Delta. Actual dependency versions, checksums, and original license files are recorded in [Cargo.lock](Cargo.lock) and the [dependency inventory](third_party/rust-dependencies/SOURCES.json). |
+
+Protocol definitions, project references, and incorporated code/data are distinct relationships. [NOTICE](NOTICE) and `third_party/` carry the third-party attribution records. These acknowledgements imply neither upstream endorsement nor support for every feature of those projects.
 
 ## License and source delivery
 

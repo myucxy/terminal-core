@@ -8,7 +8,7 @@ TermLink 自研的跨平台终端状态引擎，使用 Rust 实现，通过 C AB
 
 自有代码采用 **[GPL-3.0-only](LICENSE)**，第三方材料保留原许可与署名，详见 [NOTICE](NOTICE)。
 
-[快速开始](#快速开始) · [集成与构建](#集成与构建) · [兼容与安全边界](#兼容与安全边界) · [文档导航](#文档导航)
+[快速开始](#快速开始) · [集成与构建](#集成与构建) · [兼容与安全边界](#兼容与安全边界) · [文档导航](#文档导航) · [参考项目与致谢](#参考项目与致谢)
 
 ## 核心能力
 
@@ -139,6 +139,28 @@ DLL 位于 `target/x86_64-pc-windows-msvc/release/termlink_terminal_ffi.dll`。�
 | 图形与 broker | [资源契约](GRAPHICS_RESOURCE_CONTRACT_20261010.md)、[图形实现记录](S6_GRAPHICS_IN_PROGRESS_20261010.md)、[Windows broker](G01_WINDOWS_BROKER_DESIGN_20261010.md) |
 | 文本与宿主状态 | [Unicode 16](S1_S4_REPORTS_UNICODE_BASELINE_20261009.md)、[行属性](S2_LINE_RENDITIONS_20261009.md)、[主题](S2_HOST_THEME_20261010.md)、[持久会话 profile](S1_PERSISTENT_SESSION_PROFILE_20261010.md) |
 | 依赖与历史说明 | [Rust 依赖来源](third_party/rust-dependencies/README.md)、[旧 README 实现说明](docs/archive/README_IMPLEMENTATION_NOTES.md) |
+
+## 参考项目与致谢
+
+感谢以下开源项目及其维护者。这里列出实际记录过的参考范围，分别说明协议与行为对照、早期方案调研和已使用的第三方材料。
+
+| 项目 | 参考范围与使用关系 |
+| --- | --- |
+| [Microsoft Windows Terminal](https://github.com/microsoft/terminal) | 用于 VT/CSI/OSC、查询回复、Unicode、颜色与窗口行为对照，源码对照固定于 [`6676c6f`](https://github.com/microsoft/terminal/commit/6676c6f938f7e98ad680f0cecedd3bafb6529734)，详见[能力对照记录](WINDOWS_TERMINAL_CAPABILITY_REVIEW_20261009.md)。另外实际使用了该版本 `charsets.hpp` 的固定字符映射数据，按 MIT 保留署名与许可，详见[数据来源](third_party/legacy-charsets/README.md)。未引入其 parser、状态机或 renderer 实现。 |
+| [xterm](https://invisible-island.net/xterm/) | [控制序列文档](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html)用于查询回复、终端模式、SGR、OSC、输入编码及兼容行为定义；core 自行实现对应的有界子集。 |
+| [kitty](https://github.com/kovidgoyal/kitty) | 参考官方[键盘协议](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)与[图形协议](https://sw.kovidgoyal.net/kitty/graphics-protocol/)，用于输入协商、图像传输与 placement 等语义；支持范围以本仓库 profile 和[图形资源契约](GRAPHICS_RESOURCE_CONTRACT_20261010.md)为准，未复用其终端实现。 |
+| [Termux](https://github.com/termux/termux-app) | TermLink 早期 Android 引擎选型及终端交互行为研究的参考项目；应用曾使用其派生模块，现已退役。当前 Rust core 与 Android JNI 不依赖 Termux 模块，也不将其差分结果作为验收门禁，详见应用仓库的[迁出记录](https://github.com/myucxy/TermLink/blob/main/docs/archive/TERMUX_CLEANUP_20261008.md)。 |
+| [xterm.js](https://github.com/xtermjs/xterm.js) | TermLink 早期 WebView 终端方案、兼容对照和主题能力调研的参考项目；不是本 Rust core 的运行依赖。 |
+| [ConnectBot termlib](https://github.com/connectbot/termlib) | TermLink 早期 Android 原生终端与 libvterm 适配方案调研的参考项目；未将其实现接入本 core。与 xterm.js 的历史选型见应用仓库的[引擎调研](https://github.com/myucxy/TermLink/blob/main/docs/ANDROID_TERMINAL_ENGINE_RESEARCH.md)，该文保留当时方案，不代表当前架构。 |
+
+此外，本仓库实际使用以下数据与依赖，其许可与来源记录随仓库保留：
+
+| 数据或依赖 | 用途与来源 |
+| --- | --- |
+| [Unicode 16.0.0](https://www.unicode.org/Public/16.0.0/ucd/) | 字素、字宽、emoji 属性和官方一致性测试数据；采用 Unicode License V3，固定源文件与哈希见[来源清单](third_party/unicode/16.0.0/SOURCE.md)。 |
+| [RustCrypto / sha2](https://github.com/RustCrypto/hashes/tree/master/sha2) | `sha2 = "=0.10.9"` 用于 State Delta 的 SHA-256；实际依赖版本、校验和与原许可文件见 [Cargo.lock](Cargo.lock) 和[依赖来源清单](third_party/rust-dependencies/SOURCES.json)。 |
+
+协议定义、项目参考与代码/数据引入是不同关系。完整第三方声明以 [NOTICE](NOTICE) 和 `third_party/` 为准；这些致谢不表示上游项目为 TermLink 背书，也不表示当前 core 具备上游的全部能力。
 
 ## 许可与源码交付
 
