@@ -182,9 +182,7 @@ pub unsafe extern "C" fn tl_terminal_broker_begin_v1(
                 let (error, diagnostic) = failure.into_parts();
                 let status = status_for_error(&error);
                 let buffer = match owned_buffer_with_limit(
-                    diagnostic
-                        .unwrap_or_else(|| error.to_string())
-                        .into_bytes(),
+                    diagnostic.unwrap_or_else(|| error.to_string()).into_bytes(),
                     diagnostic_capacity,
                     8192,
                 ) {

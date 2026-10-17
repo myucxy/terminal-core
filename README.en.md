@@ -10,6 +10,8 @@ Project-owned code uses **[GPL-3.0-only](LICENSE)**. Third-party material retain
 
 [Quick start](#quick-start) · [Integration and builds](#integration-and-builds) · [Compatibility and safety](#compatibility-and-safety) · [Documentation](#documentation) · [References and acknowledgements](#references-and-acknowledgements)
 
+Prebuilt dependencies and matching source are distributed through [GitHub Releases](https://github.com/myucxy/terminal-core/releases). Pin the version, commit, and an independently trusted signing-key fingerprint before import. The [release and consumption guide](docs/RELEASE.md) covers local builds, signing, draft upload/download verification, and application rollback. A release candidate is not a full product acceptance claim.
+
 ## Core capabilities
 
 | Area | Available in the current code |
@@ -132,6 +134,7 @@ This repository was split from `terminal-core/` at `myucxy/TermLink@78c011b` on 
 
 | Topic | Documents |
 | --- | --- |
+| Dependency releases and import | [Release assets, signatures, corresponding source, and application import](docs/RELEASE.md) |
 | Implementation and product gates | [Integration records](INTEGRATION_STATUS_20261010.md), [22-group acceptance matrix](PRODUCT_ACCEPTANCE_MATRIX_20261010.md) |
 | Roadmap and original gaps | [Roadmap](DEVELOPMENT_ROADMAP.md), [implementation plan](FULL_CAPABILITY_IMPLEMENTATION_PLAN_20261009.md), [historical gaps and completion criteria](UNIMPLEMENTED_CAPABILITIES.md) |
 | C ABI and diagnostics | [Public header](include/termlink_terminal.h), [Input Diagnostic V1](INPUT_DIAGNOSTIC_V1.md) |

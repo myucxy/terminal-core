@@ -10,6 +10,8 @@ TermLink 自研的跨平台终端状态引擎，使用 Rust 实现，通过 C AB
 
 [快速开始](#快速开始) · [集成与构建](#集成与构建) · [兼容与安全边界](#兼容与安全边界) · [文档导航](#文档导航) · [参考项目与致谢](#参考项目与致谢)
 
+预编译依赖包与匹配源码通过 [GitHub Releases](https://github.com/myucxy/terminal-core/releases) 分发，按固定版本、commit 与独立可信签名指纹校验后导入。[发布与消费流程](docs/RELEASE.md)包含本机构建、签名、Draft 上传回验和应用回滚步骤；候选版不代表完整产品验收。
+
 ## 核心能力
 
 | 范围 | 当前代码提供的能力 |
@@ -132,6 +134,7 @@ DLL 位于 `target/x86_64-pc-windows-msvc/release/termlink_terminal_ffi.dll`。�
 
 | 主题 | 文档 |
 | --- | --- |
+| 依赖包发布与导入 | [Release 产物、签名、源码与应用导入](docs/RELEASE.md) |
 | 实施状态与产品门禁 | [整合状态](INTEGRATION_STATUS_20261010.md)、[22 组产品验收矩阵](PRODUCT_ACCEPTANCE_MATRIX_20261010.md) |
 | 路线与原始缺口 | [开发路线图](DEVELOPMENT_ROADMAP.md)、[全量实施计划](FULL_CAPABILITY_IMPLEMENTATION_PLAN_20261009.md)、[缺口历史与完成标准](UNIMPLEMENTED_CAPABILITIES.md) |
 | C ABI 与诊断 | [公共头文件](include/termlink_terminal.h)、[输入诊断 V1](INPUT_DIAGNOSTIC_V1.md) |

@@ -75,14 +75,14 @@ dependencies = [
 
 [[package]]
 name = "termlink-terminal-core"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "termlink-terminal-ffi"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "termlink-terminal-core",
 ]

@@ -1179,11 +1179,7 @@ impl Terminal {
         source_sequence: u64,
         bytes: &[u8],
     ) -> Result<PreparedBrokerOutputV1<'_>, BrokerPrepareError> {
-        self.prepare_output_with_broker_captures_v1_with_diagnostic(
-            source_sequence,
-            bytes,
-            &[],
-        )
+        self.prepare_output_with_broker_captures_v1_with_diagnostic(source_sequence, bytes, &[])
     }
 
     /// Replays one Output once with a bounded prefix of immutable captures. The parser verifies
@@ -1194,8 +1190,12 @@ impl Terminal {
         bytes: &[u8],
         captures: &[kitty_graphics::BrokerCapture],
     ) -> Result<PreparedBrokerOutputV1<'_>, TerminalError> {
-        self.prepare_output_with_broker_captures_v1_with_diagnostic(source_sequence, bytes, captures)
-            .map_err(|failure| failure.into_parts().0)
+        self.prepare_output_with_broker_captures_v1_with_diagnostic(
+            source_sequence,
+            bytes,
+            captures,
+        )
+        .map_err(|failure| failure.into_parts().0)
     }
 
     /// Diagnostic-preserving variant of
